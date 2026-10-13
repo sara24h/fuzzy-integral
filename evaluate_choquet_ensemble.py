@@ -42,12 +42,8 @@ for _p in (_HERE, os.getcwd()):
         sys.path.insert(0, _p)
 
 import efficiency_utils as eff
-from old_dataset_utils import create_dataloaders
+from dataset_utils import create_dataloaders
 
-
-# =============================================================================
-# Constants
-# =============================================================================
 DATASET_CHOICES = ['wild', 'hard_fake_real', 'deepfake_lab', 'uadfV',
                    'custom_genai', 'custom_genai_v2', 'real_fake_dataset']
 
@@ -89,8 +85,6 @@ OUTPUT_KIND_DESC = {
     'logit_two': '2-class logits -> softmax, index 1 = P(real)',
     'prob_two': '2-class probabilities, index 1 = P(real)',
 }
-
-
 # =============================================================================
 # Arguments / reproducibility
 # =============================================================================
@@ -306,7 +300,6 @@ def raw_to_prob_real(raw, kind):
         return raw[:, 1]
     raise ValueError(f'Unknown output kind: {kind}')
 
-
 # =============================================================================
 # Choquet fuzzy integral + genetic algorithm (paper, Section 3)
 # =============================================================================
@@ -501,7 +494,6 @@ def evaluate_and_report(name, dataset, y_true, y_score, save_dir):
     print(f'Saved confusion matrix: {cm_path}')
     return m
 
-
 # =============================================================================
 # Training curves (from the 'history' stored inside a checkpoint, if any)
 # =============================================================================
@@ -612,7 +604,6 @@ def run_efficiency(methods, test_loader, device):
     del lat_inputs, thr_inputs
     if device.type == 'cuda':
         torch.cuda.empty_cache()
-
 
 # =============================================================================
 # Main
