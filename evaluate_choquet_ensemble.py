@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
 Evaluation of three pruned PyTorch deepfake detectors and of their Choquet fuzzy-integral
 ensemble (Karakose et al., "A New Approach for Deepfake Detection with the Choquet Fuzzy
@@ -23,6 +25,7 @@ Example:
 import os
 import sys
 import copy
+import json
 import random
 import argparse
 
@@ -44,6 +47,10 @@ for _p in (_HERE, os.getcwd()):
 import efficiency_utils as eff
 from dataset_utils import create_dataloaders
 
+
+# =============================================================================
+# Constants
+# =============================================================================
 DATASET_CHOICES = ['wild', 'hard_fake_real', 'deepfake_lab', 'uadfV',
                    'custom_genai', 'custom_genai_v2', 'real_fake_dataset']
 
@@ -59,13 +66,7 @@ DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2
 
 ENSEMBLE_NAME = 'choquet_ensemble'
 
-# Efficiency protocol (same defaults as efficiency_utils.benchmark_efficiency)
-LATENCY_SAMPLES = 300
-LATENCY_WARMUP = 50
-THROUGHPUT_BATCHES = 20
-THROUGHPUT_WARMUP = 30
-THROUGHPUT_ITERS = 100
-THROUGHPUT_REPEATS = 3
+# passes over the whole test set when timing each single model (same default as efficiency_utils)
 FULL_PASS_REPEATS = 3
 
 # Genetic-algorithm helpers
@@ -85,6 +86,8 @@ OUTPUT_KIND_DESC = {
     'logit_two': '2-class logits -> softmax, index 1 = P(real)',
     'prob_two': '2-class probabilities, index 1 = P(real)',
 }
+
+
 # =============================================================================
 # Arguments / reproducibility
 # =============================================================================
@@ -106,6 +109,10 @@ def parse_args():
                    help='Number of epochs shown in the training curves '
                         '(default: all epochs stored in the checkpoint history).')
     p.add_argument('--num_workers', type=int, default=2, help='DataLoader workers.')
+    p.add_argument('--latency_samples', type=int, default=None,
+                   help='Number of test images (batch size 1) used for the latency benchmark '
+                        '(default: the whole test set, as in the training pipeline; all of them are '
+                        'cached on the GPU, so lower this for very large test sets).')
     p.add_argument('--save_dir', type=str, default='./eval_results',
                    help='Directory for result txt files and figures.')
     # genetic algorithm hyper-parameters (defaults = values reported in the paper)
@@ -131,6 +138,8 @@ def parse_args():
         p.error('--epochs must be >= 1.')
     if args.num_workers < 0:
         p.error('--num_workers must be >= 0.')
+    if args.latency_samples is not None and args.latency_samples < 1:
+        p.error('--latency_samples must be >= 1.')
     if args.ga_pop_size < 2:
         p.error('--ga_pop_size must be >= 2.')
     if args.ga_max_iter < 1 or args.ga_early_stopping < 1:
@@ -204,12 +213,21 @@ def _torch_load(path, device):
         return torch.load(path, map_location=device)
 
 
+def import_pruned_architecture():
+    try:
+        from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
+    except ImportError as e:
+        raise ImportError('Cannot import ResNet_50_pruned_hardfakevsreal from model.ResNet_pruned. '
+                          'Make sure the `model` package is in the working directory or on PYTHONPATH.') from e
+    return ResNet_50_pruned_hardfakevsreal
+
+
 def load_checkpoint(path, device):
     """Returns (model in eval mode on `device`, training history dict or None)."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f'Checkpoint not found: {path}')
     try:
-        ckpt = _torch_load(path, device)
+        ckpt = _torch_load(path, 'cpu')
     except Exception as load_err:
         try:
             ckpt = torch.jit.load(path, map_location=device)
@@ -222,6 +240,12 @@ def load_checkpoint(path, device):
     history, model = None, None
     if isinstance(ckpt, nn.Module):
         model = ckpt
+    elif isinstance(ckpt, dict) and 'masks' in ckpt and 'model_state_dict' in ckpt:
+        # pruned ResNet-50 checkpoint: {'masks': ..., 'model_state_dict': ..., [optional 'history']}
+        history = ckpt.get('history')
+        arch_cls = import_pruned_architecture()
+        model = arch_cls(masks=ckpt['masks'])
+        model.load_state_dict(ckpt['model_state_dict'])
     elif isinstance(ckpt, dict):
         history = ckpt.get('history')
         for key in ('model', 'model_state_dict', 'state_dict', 'net', 'network'):
@@ -299,6 +323,7 @@ def raw_to_prob_real(raw, kind):
     if kind == 'prob_two':
         return raw[:, 1]
     raise ValueError(f'Unknown output kind: {kind}')
+
 
 # =============================================================================
 # Choquet fuzzy integral + genetic algorithm (paper, Section 3)
@@ -494,6 +519,7 @@ def evaluate_and_report(name, dataset, y_true, y_score, save_dir):
     print(f'Saved confusion matrix: {cm_path}')
     return m
 
+
 # =============================================================================
 # Training curves (from the 'history' stored inside a checkpoint, if any)
 # =============================================================================
@@ -554,56 +580,95 @@ def plot_training_curves(history, num_epochs, save_dir, model_name):
 
 
 # =============================================================================
-# Efficiency (efficiency_utils.py)
+# Efficiency: latency / throughput / computational time (efficiency_utils.benchmark_efficiency)
 # =============================================================================
-def print_efficiency(name, lat, thr, fp):
-    print(f'\n[{name}]')
-    print(f"  Latency (bs=1, {lat['num_samples']} samples): mean {lat['mean_ms']:.2f} ± {lat['std_ms']:.2f} ms | "
-          f"median {lat['median_ms']:.2f} | p95 {lat['p95_ms']:.2f} | p99 {lat['p99_ms']:.2f} | "
-          f"min {lat['min_ms']:.2f} | max {lat['max_ms']:.2f} ms")
-    print(f"  Throughput (bs=1)  : {lat['throughput_bs1_img_per_s']:.1f} images/s")
-    print(f"  Throughput (bs={thr['batch_size']}) : {thr['throughput_img_per_s']:.1f} ± "
-          f"{thr['throughput_std_img_per_s']:.1f} images/s "
-          f"(mean ± std of {thr['repeats']} runs, {thr['ms_per_image']:.3f} ms/image)")
-    if 'extra_peak_mem_mb' in thr:
-        print(f"  Extra peak GPU memory (bs={thr['batch_size']}): {thr['extra_peak_mem_mb']:.1f} MB")
-    print(f"  Computational time (whole test set, {fp['num_images']} images, mean of {fp['repeats']} passes): "
-          f"model compute {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f} s "
-          f"({fp['img_per_s_compute']:.1f} img/s) | end-to-end incl. data loading "
-          f"{fp['total_time_s']:.2f} ± {fp['total_time_std_s']:.2f} s ({fp['img_per_s_end_to_end']:.1f} img/s)")
+class MultiModelNormalization(nn.Module):
+    def __init__(self, means, stds):
+        super().__init__()
+        for i, (m, s) in enumerate(zip(means, stds)):
+            self.register_buffer(f'mean_{i}', torch.tensor(m).view(1, 3, 1, 1))
+            self.register_buffer(f'std_{i}', torch.tensor(s).view(1, 3, 1, 1))
+
+    def forward(self, x, idx):
+        return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-def run_efficiency(methods, test_loader, device):
-    test_ds = test_loader.dataset
-    n_lat = min(LATENCY_SAMPLES, len(test_ds))
-    idx = np.sort(np.random.RandomState(0).choice(len(test_ds), n_lat, replace=False))
-    lat_inputs = [test_ds[int(i)][0].unsqueeze(0).to(device) for i in idx]
-    thr_inputs = []
-    for images, _ in test_loader:
-        thr_inputs.append(images.to(device))
-        if len(thr_inputs) >= THROUGHPUT_BATCHES:
-            break
+class NoRouter(nn.Module):
+    """
+    Stand-in for the `hesitant_fuzzy` router expected by efficiency_utils. The Choquet ensemble has no
+    routing network (all models always run), so this returns weight 1 for every model.
+    """
+    def __init__(self, num_models):
+        super().__init__()
+        self.num_models = num_models
 
-    print('\n' + '=' * 70)
-    print('EFFICIENCY: computational time / latency / throughput (efficiency_utils)')
-    print('=' * 70)
-    for key, val in eff.environment_info(device).items():
-        print(f'  {key}: {val}')
-    print(f'  Latency: batch=1, {n_lat} samples, warm-up={LATENCY_WARMUP} | '
-          f'Throughput: batch={thr_inputs[0].size(0)}, {THROUGHPUT_ITERS} iters x {THROUGHPUT_REPEATS} runs, '
-          f'warm-up={THROUGHPUT_WARMUP} | Full test pass: {FULL_PASS_REPEATS} passes')
+    def forward(self, x):
+        return torch.ones(x.size(0), self.num_models, device=x.device)
 
-    for name, fn in methods:
-        lat, _ = eff.measure_latency(fn, lat_inputs, device, warmup=LATENCY_WARMUP)
-        thr = eff.measure_throughput(fn, thr_inputs, device, warmup_iters=THROUGHPUT_WARMUP,
-                                     num_iters=THROUGHPUT_ITERS, repeats=THROUGHPUT_REPEATS)
+
+class ChoquetEnsemble(nn.Module):
+    """
+    Choquet fuzzy-integral ensemble exposing the interface used by efficiency_utils:
+      .models, .normalizations(x, i), .hesitant_fuzzy(x), forward(x) -> (fused_score, weights)
+    fused_score = Choquet integral of the three P(real) scores (shape (B,)); weights = ones (B, M).
+    """
+    def __init__(self, models, means, stds, kinds, g):
+        super().__init__()
+        self.num_models = len(models)
+        self.models = nn.ModuleList(models)
+        self.normalizations = MultiModelNormalization(means, stds)
+        self.hesitant_fuzzy = NoRouter(self.num_models)
+        self.kinds = list(kinds)
+        self.register_buffer('g', torch.as_tensor(np.asarray(g), dtype=torch.float32))
+        for m in self.models:
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad = False
+
+    def forward(self, x, return_details=False):
+        probs = []
+        for i in range(self.num_models):
+            out = standardize_output(self.models[i](self.normalizations(x, i)))
+            probs.append(raw_to_prob_real(out.float(), self.kinds[i]))
+        fused = choquet_integral(torch.stack(probs, dim=1), self.g)
+        weights = torch.ones(x.size(0), self.num_models, device=x.device)
+        return fused, weights
+
+
+def run_efficiency(ensemble, names, test_loader, device, save_dir, latency_samples):
+    n_total = len(test_loader.dataset)
+    n_lat = n_total if latency_samples is None else min(latency_samples, n_total)
+    if n_lat > 5000:
+        print(f'[note] latency benchmark uses {n_lat} test images cached on the GPU; '
+              f'use --latency_samples to reduce memory/time if this is too heavy.')
+
+    # latency (bs=1), throughput (batched) and full-test-pass time for the ensemble and every single model
+    results = eff.benchmark_efficiency(ensemble, test_loader, device, names,
+                                       latency_samples=n_lat, verbose=True)
+
+    # computational time of every single model on the whole test set (model compute only)
+    singles = {}
+    print('\nComputational time of each single model on the whole test set '
+          f'(mean of {FULL_PASS_REPEATS} passes):')
+    for i, name in enumerate(names):
+        fn = (lambda x, i=i: ensemble.models[i](ensemble.normalizations(x, i)))
         fp = eff.measure_full_pass(fn, test_loader, device, repeats=FULL_PASS_REPEATS)
-        print_efficiency(name, lat, thr, fp)
-    print('=' * 70 + '\n')
+        singles[name] = fp
+        print(f"  {name:<24} model compute {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f} s "
+              f"({fp['img_per_s_compute']:.1f} img/s) | end-to-end incl. data loading {fp['total_time_s']:.2f} s")
+    results['full_test_pass_single_models'] = singles
 
-    del lat_inputs, thr_inputs
+    print('\n(In the summary below, "HFDE" is the label used by efficiency_utils; here it is the '
+          'Choquet ensemble, which always runs all models.)')
+    eff.print_headline(results)
+
+    report_path = os.path.join(save_dir, 'efficiency_report.json')
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f'Efficiency report saved: {report_path}')
     if device.type == 'cuda':
         torch.cuda.empty_cache()
+
 
 # =============================================================================
 # Main
@@ -639,10 +704,11 @@ def main():
     fit_loader = make_fit_loader(train_loader, val_loader, args.batch_size, args.num_workers, device)
 
     # ---- models ------------------------------------------------------------
-    forwards, histories = [], []
+    models, forwards, histories = [], [], []
     for i, (name, path) in enumerate(zip(args.model_names, args.model_paths)):
         print(f'\nLoading model {name} ...')
         model, history = load_checkpoint(path, device)
+        models.append(model)
         forwards.append(build_forward(model, DEFAULT_MEANS[i], DEFAULT_STDS[i], device))
         histories.append(history)
 
@@ -715,16 +781,10 @@ def main():
         else:
             plot_training_curves(series, num_epochs, args.save_dir, name)
 
-    # ---- efficiency ----------------------------------------------------------
-    g_dev = torch.tensor(g_best, dtype=torch.float32, device=device)
-
-    def ensemble_fn(x):
-        probs = [raw_to_prob_real(standardize_output(f(x)).float(), k) for f, k in zip(forwards, kinds)]
-        return choquet_integral(torch.stack(probs, dim=1), g_dev)
-
-    methods = [(name, forwards[i]) for i, name in enumerate(args.model_names)]
-    methods.append((f'{ENSEMBLE_NAME} (3 models + Choquet integral)', ensemble_fn))
-    run_efficiency(methods, test_loader, device)
+    # ---- efficiency (efficiency_utils.benchmark_efficiency, as in the training pipeline) ----
+    ensemble = ChoquetEnsemble(models, DEFAULT_MEANS, DEFAULT_STDS, kinds, g_best).to(device)
+    ensemble.eval()
+    run_efficiency(ensemble, args.model_names, test_loader, device, args.save_dir, args.latency_samples)
 
     print(f'All outputs were saved to: {os.path.abspath(args.save_dir)}')
 
