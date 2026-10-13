@@ -263,7 +263,7 @@ def benchmark_efficiency(ensemble, test_loader, device, model_names,
 
     # ---- callables to benchmark -------------------------------------------
     methods = {
-        'HFDE (dynamic)': lambda x: ensemble(x),
+        'Fuzzy Integral': lambda x: ensemble(x),
         'Router only': lambda x: ensemble.hesitant_fuzzy(x),
     }
     for i in range(n_models):
@@ -315,7 +315,7 @@ def benchmark_efficiency(ensemble, test_loader, device, model_names,
                                  num_iters=throughput_iters,
                                  repeats=throughput_repeats)
         results['methods'][name] = {'latency': lat, 'throughput': thr}
-        if name == 'HFDE (dynamic)':
+        if name == 'Fuzzy Integral':
             hfde_outs = outs
         if verbose:
             print(f"  {name:<34} lat {lat['mean_ms']:7.2f} ± {lat['std_ms']:5.2f} ms | "
@@ -339,16 +339,16 @@ def benchmark_efficiency(ensemble, test_loader, device, model_names,
         executed = [int((ensemble(x)[1] > 0).any(dim=0).sum().item()) for x in thr_inputs]
     results['dynamic_routing'][f'mean_models_executed_per_batch_bs{batch_size}'] = float(np.mean(executed))
     if verbose:
-        print(f"\n  HFDE avg. active models / sample (bs=1): "
+        print(f"\n  Fuzzy Integral avg. active models / sample (bs=1): "
               f"{results['dynamic_routing']['mean_active_models_per_sample_bs1']:.2f} of {n_models}")
-        print(f"  HFDE avg. models executed / batch (bs={batch_size}): {np.mean(executed):.2f} of {n_models}")
+        print(f"  Fuzzy Integral avg. models executed / batch (bs={batch_size}): {np.mean(executed):.2f} of {n_models}")
 
     # ---- full test pass (end-to-end, includes data loading) ---------------
     results['full_test_pass_hfde'] = measure_full_pass(
-        methods['HFDE (dynamic)'], test_loader, device, repeats=full_pass_repeats)
+        methods['Fuzzy Integral'], test_loader, device, repeats=full_pass_repeats)
     fp = results['full_test_pass_hfde']
     if verbose:
-        print(f"  Full test pass (HFDE, mean of {fp['repeats']} passes): {fp['num_images']} images | "
+        print(f"  Full test pass (Fuzzy Integral, mean of {fp['repeats']} passes): {fp['num_images']} images | "
               f"model compute {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f}s | "
               f"end-to-end incl. data loading {fp['total_time_s']:.2f}s "
               f"({fp['img_per_s_end_to_end']:.1f} img/s)")
@@ -361,8 +361,8 @@ def benchmark_efficiency(ensemble, test_loader, device, model_names,
     return results
 
 def print_headline(results):
-    """Print ONLY the three headline numbers for HFDE."""
-    h = results['methods']['HFDE (dynamic)']
+    """Print ONLY the three headline numbers for Fuzzy Integral."""
+    h = results['methods']['Fuzzy Integral']
     thr = h['throughput']
     bs = thr['batch_size']
     fp = results['full_test_pass_hfde']
