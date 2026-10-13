@@ -64,7 +64,7 @@ FULL_PASS_REPEATS = 3
 # Genetic-algorithm helpers
 FUZZY_EPS = 1e-6                              # margin that makes Eq. (1) a strict inequality
 PAIR_INDICES = [(0, 1), (0, 2), (1, 2)]       # g12, g13, g23  == genes 3, 4, 5
-TOURNAMENT_SIZE = 3
+
 
 HISTORY_KEYS = ('train_loss', 'val_loss', 'train_acc', 'val_acc')
 
@@ -114,6 +114,8 @@ def parse_args():
                    help='GA stops after this many generations without improvement.')
     p.add_argument('--ga_crossover_prob', type=float, default=0.7, help='GA crossover probability.')
     p.add_argument('--ga_mutation_prob', type=float, default=0.3, help='GA mutation probability.')
+    p.add_argument('--ga_tournament_size', type=int, default=3,
+                   help='GA tournament selection size (paper does not specify; default 3).')
     args = p.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -138,6 +140,11 @@ def parse_args():
         p.error('--ga_max_iter and --ga_early_stopping must be >= 1.')
     if not (0.0 <= args.ga_crossover_prob <= 1.0 and 0.0 <= args.ga_mutation_prob <= 1.0):
         p.error('GA probabilities must lie in [0, 1].')
+
+    if args.ga_tournament_size < 2:
+        p.error('--ga_tournament_size must be >= 2.')
+    if args.ga_tournament_size > args.ga_pop_size:
+        p.error('--ga_tournament_size must be <= --ga_pop_size.')
     return args
 
 
@@ -360,7 +367,7 @@ def is_feasible(g):
 
 
 def fit_fuzzy_measure_ga(scores, labels_bool, pop_size, max_iter, early_stopping,
-                         p_cross, p_mut, seed):
+                         p_cross, p_mut, tournament_size, seed):
     """
     Genetic algorithm that learns the fuzzy measures (paper Fig. 4).
     scores      : (N, 3) float64 tensor, detector outputs P(real) on the training split
@@ -381,7 +388,7 @@ def fit_fuzzy_measure_ga(scores, labels_bool, pop_size, max_iter, early_stopping
         return repair_individual(np.concatenate([singles, pairs]))
 
     def tournament(pop, fits):
-        idx = rng.randint(0, len(pop), size=TOURNAMENT_SIZE)
+        idx = rng.randint(0, len(pop), size=tournament_size)
         return pop[idx[int(np.argmax(fits[idx]))]]
 
     pop = np.stack([random_individual() for _ in range(pop_size)])
@@ -686,7 +693,7 @@ def main():
           f'seed={args.seed} | epochs={args.epochs} | num_workers={args.num_workers}')
     print(f'  GA: pop_size={args.ga_pop_size}, max_iter={args.ga_max_iter}, '
           f'early_stopping={args.ga_early_stopping}, crossover_prob={args.ga_crossover_prob}, '
-          f'mutation_prob={args.ga_mutation_prob}')
+          f'mutation_prob={args.ga_mutation_prob}, tournament_size={args.ga_tournament_size}')
     print(f'  device={device} | save_dir={args.save_dir}')
     for n, p in zip(args.model_names, args.model_paths):
         print(f'  model {n}: {p}')
@@ -747,7 +754,7 @@ def main():
     print('=' * 70)
     g_best, ga_acc = fit_fuzzy_measure_ga(
         scores_fit, labels_fit, args.ga_pop_size, args.ga_max_iter, args.ga_early_stopping,
-        args.ga_crossover_prob, args.ga_mutation_prob, args.seed)
+        args.ga_crossover_prob, args.ga_mutation_prob, args.ga_tournament_size, args.seed)
     names = args.model_names
     print(f'\nLearned fuzzy measures (x1={names[0]}, x2={names[1]}, x3={names[2]}); train accuracy {ga_acc * 100:.2f}%')
     print(f'  g{{}}         = 0')
