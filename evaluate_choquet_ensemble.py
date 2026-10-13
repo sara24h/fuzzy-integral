@@ -1,10 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Evaluation of three pruned PyTorch deepfake detectors and of their Choquet fuzzy-integral
-ensemble (Karakose et al., "A New Approach for Deepfake Detection with the Choquet Fuzzy
-Integral", Appl. Sci. 2024, 14, 7216).
-
 Labeling convention: Real = 1 (positive class), Fake = 0 (negative class).
 
 Paper implementation (Section 3):
@@ -16,10 +12,6 @@ Paper implementation (Section 3):
     fitness = correct-classification rate, super-additive constraint = Eq. (1),
     g{} = 0 and g{x1,x2,x3} = 1);
   * fused value  < 0.5 -> fake,   fused value > 0.5 -> real.
-
-Example:
-  python evaluate_choquet_ensemble.py --dataset custom_genai --data_dir /path/to/data \
-         --batch_size 64 --seed 42 --epochs 30 --save_dir ./eval_results
 """
 
 import os
@@ -76,7 +68,7 @@ TOURNAMENT_SIZE = 3
 
 HISTORY_KEYS = ('train_loss', 'val_loss', 'train_acc', 'val_acc')
 
-METRIC_KEYS = ['precision_real', 'recall_real', 'f1_real',
+METRIC_KEYS = ['acc','precision_real', 'recall_real', 'f1_real',
                'precision_fake', 'recall_fake', 'f1_fake',
                'macro_precision', 'macro_recall', 'macro_f1']
 
@@ -449,9 +441,11 @@ def compute_metrics(y_true, y_pred):
     precision_fake = safe_div(tn, tn + fn)
     recall_fake = safe_div(tn, tn + fp)
     f1_fake = safe_div(2 * precision_fake * recall_fake, precision_fake + recall_fake)
+    acc = safe_div(tp + tn, tp + tn + fp + fn) * 100.0
 
     return {
         'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+        'acc': acc,
         'precision_real': precision_real, 'recall_real': recall_real, 'f1_real': f1_real,
         'precision_fake': precision_fake, 'recall_fake': recall_fake, 'f1_fake': f1_fake,
         'macro_precision': (precision_real + precision_fake) / 2,
@@ -470,8 +464,11 @@ def print_metrics_table(name, dataset, m):
           f"(total={m['tp'] + m['fp'] + m['tn'] + m['fn']})")
     print(f"{'Metric':<22}{'Value':>12}")
     print('-' * 34)
+
+    print(f"{'accuracy (%)':<22}{m['acc']:>12.2f}")
     for key in METRIC_KEYS:
         print(f'{key:<22}{m[key]:>12.4f}')
+    
     print(f"{'balanced_acc (%)':<22}{m['balanced_acc']:>12.2f}")
     print(line)
 
