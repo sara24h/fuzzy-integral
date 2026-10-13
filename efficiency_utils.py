@@ -2,20 +2,16 @@ import time
 import numpy as np
 import torch
 
-
 def _sync(device):
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
 
-
 def _first(out):
     return out[0] if isinstance(out, (tuple, list)) else out
-
 
 def _mean_std(values):
     v = np.asarray(values, dtype=float)
     return float(v.mean()), (float(v.std(ddof=1)) if len(v) > 1 else 0.0)
-
 
 class Stopwatch:
     """Wall-clock timer that synchronizes the GPU on start/stop."""
@@ -33,7 +29,6 @@ class Stopwatch:
         _sync(self.device)
         return time.perf_counter() - self.t0
 
-
 def environment_info(device):
     info = {'torch_version': torch.__version__, 'device': str(device)}
     if device.type == 'cuda':
@@ -50,7 +45,6 @@ def environment_info(device):
         })
     return info
 
-
 # ---------------------------------------------------- training-time summary
 def summarize_training_times(epoch_times, train_times, val_times, total_time):
     et = np.asarray(epoch_times, dtype=float)
@@ -66,8 +60,7 @@ def summarize_training_times(epoch_times, train_times, val_times, total_time):
         'epoch_times_s': [float(v) for v in et],
     }
 
-
-# ------------------------------------------------------------ warm-up
+#------------------------------------------------------------ warm-up
 @torch.no_grad()
 def _warmup_all(ensemble, lat_inputs, thr_inputs, device, n_models,
                 tail_size=0, iters=30, min_seconds=3.0):
@@ -105,7 +98,6 @@ def _warmup_all(ensemble, lat_inputs, thr_inputs, device, n_models,
             ensemble(x)
             _sync(device)
             k += 1
-
 
 # ------------------------------------------------------------ measurements
 @torch.no_grad()
@@ -147,7 +139,6 @@ def measure_latency(fn, samples, device, warmup=50):
         'throughput_bs1_img_per_s': float(1000.0 / t.mean()),
     }
     return stats, outs
-
 
 @torch.no_grad()
 def measure_throughput(fn, batches, device, warmup_iters=30, num_iters=100, repeats=3):
@@ -200,7 +191,6 @@ def measure_throughput(fn, batches, device, warmup_iters=30, num_iters=100, repe
             (torch.cuda.max_memory_allocated(device) - base_mem) / 2 ** 20)
     return res
 
-
 @torch.no_grad()
 def measure_full_pass(fn, loader, device, repeats=3):
     """
@@ -242,7 +232,6 @@ def measure_full_pass(fn, loader, device, repeats=3):
         'total_time_runs_s': [float(v) for v in wall_runs],
         'img_per_s_end_to_end': float(n / w_mean),
     }
-
 
 # ------------------------------------------------------------ main benchmark
 def benchmark_efficiency(ensemble, test_loader, device, model_names,
@@ -371,7 +360,6 @@ def benchmark_efficiency(ensemble, test_loader, device, model_names,
         torch.cuda.empty_cache()
     return results
 
-
 def print_headline(results):
     """Print ONLY the three headline numbers for HFDE."""
     h = results['methods']['HFDE (dynamic)']
@@ -379,7 +367,7 @@ def print_headline(results):
     bs = thr['batch_size']
     fp = results['full_test_pass_hfde']
     print("=" * 70)
-    print("HFDE EFFICIENCY SUMMARY")
+    print("Fuzzy Integral EFFICIENCY SUMMARY")
     print("=" * 70)
     print(f"Latency (bs=1)          : {h['latency']['mean_ms']:.2f} ± {h['latency']['std_ms']:.2f} ms / image")
     print(f"Throughput (bs={bs})".ljust(24) +
