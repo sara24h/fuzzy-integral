@@ -1,92 +1,72 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Choquet Fuzzy Integral Ensemble — Multi-GPU (mirrors Simple Averaging parallelism).
-Labeling convention: Real = 1 (positive class), Fake = 0 (negative class).
-"""
+
+
 import os
 import sys
 import copy
 import json
 import random
 import argparse
+import threading
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from torch.utils.data import DataLoader
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# make the user's local modules (dataset_utils.py, efficiency_utils.py) importable
 _HERE = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
 for _p in (_HERE, os.getcwd()):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 import efficiency_utils as eff
-from efficiency_utils import Stopwatch, benchmark_efficiency
 from dataset_utils import create_dataloaders
+
 
 # =============================================================================
 # Constants
 # =============================================================================
 DATASET_CHOICES = ['wild', 'hard_fake_real', 'deepfake_lab', 'uadfV',
                    'custom_genai', 'custom_genai_v2', 'real_fake_dataset']
+
 DEFAULT_MODEL_NAMES = ['140k_pearson', '200k_pearson', '190k_pearson']
 DEFAULT_MODEL_PATHS = [
     '/kaggle/input/models/saraaskari/140k-pearson-pruned/pytorch/default/1/140k_pearson_pruned.pt',
     '/kaggle/input/datasets/sarahemmat/200k-undersampled-pruned/200k_final.pt',
     '/kaggle/input/models/saraaskari/190k-pearson-pruned/pytorch/default/1/190k_pearson_pruned.pt',
 ]
+
 DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+
 ENSEMBLE_NAME = 'choquet_ensemble'
+
+# passes over the whole test set when timing each single model (same default as efficiency_utils)
 FULL_PASS_REPEATS = 3
-FUZZY_EPS = 1e-6
-PAIR_INDICES = [(0, 1), (0, 2), (1, 2)]
+
+# Genetic-algorithm helpers
+FUZZY_EPS = 1e-6                              # margin that makes Eq. (1) a strict inequality
+PAIR_INDICES = [(0, 1), (0, 2), (1, 2)]       # g12, g13, g23  == genes 3, 4, 5
+
+
 HISTORY_KEYS = ('train_loss', 'val_loss', 'train_acc', 'val_acc')
-METRIC_KEYS = ['acc', 'precision_real', 'recall_real', 'f1_real',
+
+METRIC_KEYS = ['acc','precision_real', 'recall_real', 'f1_real',
                'precision_fake', 'recall_fake', 'f1_fake',
                'macro_precision', 'macro_recall', 'macro_f1']
+
 OUTPUT_KIND_DESC = {
     'logit_single': 'single logit -> sigmoid = P(real)',
     'prob_single': 'single probability = P(real)',
     'logit_two': '2-class logits -> softmax, index 1 = P(real)',
     'prob_two': '2-class probabilities, index 1 = P(real)',
 }
-
-# =============================================================================
-# Distributed helpers
-# =============================================================================
-def setup_distributed():
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
-        device = torch.device(f'cuda:{local_rank}')
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend='nccl', device_id=device)
-        if rank == 0:
-            print(f'Distributed: rank {rank}/{world_size}, local_rank {local_rank}')
-        return device, local_rank, rank, world_size
-    else:
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        return device, 0, 0, 1
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def is_main_process(rank):
-    return rank == 0
-
-
-def barrier():
-    if dist.is_initialized():
-        dist.barrier(device_ids=[torch.cuda.current_device()])
 
 
 # =============================================================================
@@ -95,35 +75,68 @@ def barrier():
 def parse_args():
     p = argparse.ArgumentParser(
         description='Evaluate three deepfake detectors and their Choquet fuzzy-integral ensemble '
-                    '(Real=1, Fake=0). Multi-GPU ready.')
-    p.add_argument('--dataset', type=str, required=True, choices=DATASET_CHOICES)
-    p.add_argument('--data_dir', type=str, required=True)
-    p.add_argument('--model_names', nargs='+', type=str, default=list(DEFAULT_MODEL_NAMES))
-    p.add_argument('--model_paths', nargs='+', type=str, default=list(DEFAULT_MODEL_PATHS))
-    p.add_argument('--batch_size', type=int, default=64)
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--epochs', type=int, default=None)
-    p.add_argument('--num_workers', type=int, default=2)
-    p.add_argument('--latency_samples', type=int, default=None)
-    p.add_argument('--save_dir', type=str, default='./eval_results')
-    p.add_argument('--ga_pop_size', type=int, default=16)
-    p.add_argument('--ga_max_iter', type=int, default=50)
-    p.add_argument('--ga_early_stopping', type=int, default=10)
-    p.add_argument('--ga_crossover_prob', type=float, default=0.7)
-    p.add_argument('--ga_mutation_prob', type=float, default=0.3)
-    p.add_argument('--ga_tournament_size', type=int, default=3)
+                    '(Real=1, Fake=0).')
+    p.add_argument('--dataset', type=str, required=True, choices=DATASET_CHOICES,
+                   help='Dataset name (passed to dataset_utils.create_dataloaders).')
+    p.add_argument('--data_dir', type=str, required=True,
+                   help='Root directory of the dataset (base_dir for dataset_utils).')
+    p.add_argument('--model_names', nargs='+', type=str, default=list(DEFAULT_MODEL_NAMES),
+                   help='Model names, paired by index with --model_paths.')
+    p.add_argument('--model_paths', nargs='+', type=str, default=list(DEFAULT_MODEL_PATHS),
+                   help='Checkpoint (.pt) paths, same order as --model_names.')
+    p.add_argument('--batch_size', type=int, default=64, help='Batch size (paper: 64).')
+    p.add_argument('--seed', type=int, default=42, help='Random seed.')
+    p.add_argument('--epochs', type=int, default=None,
+                   help='Number of epochs shown in the training curves '
+                        '(default: all epochs stored in the checkpoint history).')
+    p.add_argument('--num_workers', type=int, default=2, help='DataLoader workers.')
+    p.add_argument('--latency_samples', type=int, default=None,
+                   help='Number of test images (batch size 1) used for the latency benchmark '
+                        '(default: the whole test set, as in the training pipeline; all of them are '
+                        'cached on the GPU, so lower this for very large test sets).')
+    p.add_argument('--save_dir', type=str, default='./eval_results',
+                   help='Directory for result txt files and figures.')
+    # genetic algorithm hyper-parameters (defaults = values reported in the paper)
+    p.add_argument('--ga_pop_size', type=int, default=16, help='GA population size.')
+    p.add_argument('--ga_max_iter', type=int, default=50, help='GA maximum generations.')
+    p.add_argument('--ga_early_stopping', type=int, default=10,
+                   help='GA stops after this many generations without improvement.')
+    p.add_argument('--ga_crossover_prob', type=float, default=0.7, help='GA crossover probability.')
+    p.add_argument('--ga_mutation_prob', type=float, default=0.3, help='GA mutation probability.')
+    p.add_argument('--ga_tournament_size', type=int, default=3,
+                   help='GA tournament selection size (paper does not specify; default 3).')
+    # ---- NEW: multi-GPU control ----
+    p.add_argument('--gpus', type=int, nargs='+', default=None,
+                   help='GPU indices to use (e.g. --gpus 0 1). Default: all visible CUDA devices. '
+                        'Pass --gpus -1 to force CPU.')
     args = p.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
-        p.error('--model_names and --model_paths must have the same length.')
+        p.error(f'--model_names ({len(args.model_names)} values) and --model_paths '
+                f'({len(args.model_paths)} values) must have the same length.')
     if len(args.model_names) != len(DEFAULT_MEANS):
-        p.error(f'Exactly {len(DEFAULT_MEANS)} models are expected.')
+        p.error(f'Exactly {len(DEFAULT_MEANS)} models are expected (one normalization set per model), '
+                f'but {len(args.model_names)} were given.')
     if len(set(args.model_names)) != len(args.model_names):
         p.error('--model_names must be unique.')
     if args.batch_size < 1:
         p.error('--batch_size must be >= 1.')
-    if args.ga_pop_size < 2 or args.ga_tournament_size > args.ga_pop_size:
-        p.error('Invalid GA parameters.')
+    if args.epochs is not None and args.epochs < 1:
+        p.error('--epochs must be >= 1.')
+    if args.num_workers < 0:
+        p.error('--num_workers must be >= 0.')
+    if args.latency_samples is not None and args.latency_samples < 1:
+        p.error('--latency_samples must be >= 1.')
+    if args.ga_pop_size < 2:
+        p.error('--ga_pop_size must be >= 2.')
+    if args.ga_max_iter < 1 or args.ga_early_stopping < 1:
+        p.error('--ga_max_iter and --ga_early_stopping must be >= 1.')
+    if not (0.0 <= args.ga_crossover_prob <= 1.0 and 0.0 <= args.ga_mutation_prob <= 1.0):
+        p.error('GA probabilities must lie in [0, 1].')
+    if args.ga_tournament_size < 2:
+        p.error('--ga_tournament_size must be >= 2.')
+    if args.ga_tournament_size > args.ga_pop_size:
+        p.error('--ga_tournament_size must be <= --ga_pop_size.')
     return args
 
 
@@ -138,6 +151,54 @@ def set_seed(seed):
 
 
 # =============================================================================
+# Multi-GPU helpers
+# =============================================================================
+def resolve_devices(requested_gpus):
+    """
+    Return the list of torch.device objects to spread models over.
+      * requested_gpus is None      -> every visible CUDA device (or CPU if none)
+      * requested_gpus == [-1]      -> force CPU
+      * requested_gpus == [0, 1]    -> cuda:0, cuda:1 (validated)
+    """
+    if requested_gpus is not None and requested_gpus == [-1]:
+        return [torch.device('cpu')]
+    if not torch.cuda.is_available():
+        print('[multi-gpu] CUDA not available, running on CPU.')
+        return [torch.device('cpu')]
+
+    num_visible = torch.cuda.device_count()
+    if requested_gpus is None:
+        ids = list(range(num_visible))
+    else:
+        for g in requested_gpus:
+            if g < 0 or g >= num_visible:
+                raise ValueError(f'--gpus contains {g}, but only {num_visible} CUDA device(s) '
+                                 f'are visible (0..{num_visible - 1}).')
+        ids = list(requested_gpus)
+
+    devices = [torch.device(f'cuda:{i}') for i in ids]
+    print(f'[multi-gpu] using devices: {[str(d) for d in devices]}')
+    return devices
+
+
+def device_for_model(idx, devices):
+    """Round-robin assignment: model i -> devices[i % len(devices)]."""
+    return devices[idx % len(devices)]
+
+
+def make_thread_loader(base_loader, batch_size, device, num_workers):
+    """
+    Build a fresh DataLoader for a worker thread.  We use a copy of the dataset so that
+    concurrent iteration is completely independent of the caller's loader.
+    """
+    ds = copy.copy(base_loader.dataset)
+    return DataLoader(
+        ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=(device.type == 'cuda'), drop_last=False,
+    )
+
+
+# =============================================================================
 # Data helpers
 # =============================================================================
 def get_class_to_idx(ds):
@@ -149,6 +210,7 @@ def get_class_to_idx(ds):
 
 
 def check_label_convention(ds):
+    """Fail early if the dataset's class indices contradict Real=1 / Fake=0."""
     class_to_idx = get_class_to_idx(ds)
     if not class_to_idx:
         return
@@ -156,30 +218,28 @@ def check_label_convention(ds):
         low = str(cls_name).lower()
         is_fake, is_real = ('fake' in low), ('real' in low)
         if is_fake and not is_real and idx != 0:
-            raise ValueError(f"Class '{cls_name}' has index {idx}, but Fake must be 0.")
+            raise ValueError(f"Class '{cls_name}' has index {idx}, but Fake must be 0. "
+                             f"class_to_idx = {class_to_idx}")
         if is_real and not is_fake and idx != 1:
-            raise ValueError(f"Class '{cls_name}' has index {idx}, but Real must be 1.")
+            raise ValueError(f"Class '{cls_name}' has index {idx}, but Real must be 1. "
+                             f"class_to_idx = {class_to_idx}")
 
 
 def validate_binary_labels(y, split_name):
     uniq = set(np.unique(y).tolist())
     if not uniq.issubset({0, 1}):
-        raise ValueError(f"{split_name} labels must be in {{0, 1}}, found {sorted(uniq)}.")
+        raise ValueError(f"{split_name} labels must be in {{0 (fake), 1 (real)}}, found {sorted(uniq)}.")
 
 
-def make_fit_loader(train_loader, val_loader, batch_size, num_workers, device, is_distributed, seed):
+def make_fit_loader(train_loader, val_loader, batch_size, num_workers, device):
+    """
+    Deterministic loader over the TRAIN split (no augmentation, no shuffling, nothing dropped),
+    used to collect the detector outputs on which the fuzzy measures are learned.
+    """
     fit_ds = copy.copy(train_loader.dataset)
-    fit_ds.transform = val_loader.dataset.transform
-    if is_distributed:
-        from torch.utils.data.distributed import DistributedSampler
-        sampler = DistributedSampler(fit_ds, shuffle=False, seed=seed)
-        return DataLoader(fit_ds, batch_size=batch_size, sampler=sampler,
-                          num_workers=num_workers, pin_memory=(device.type == 'cuda'),
-                          drop_last=False)
-    else:
-        return DataLoader(fit_ds, batch_size=batch_size, shuffle=False,
-                          num_workers=num_workers, pin_memory=(device.type == 'cuda'),
-                          drop_last=False)
+    fit_ds.transform = val_loader.dataset.transform       # eval-time preprocessing
+    return DataLoader(fit_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                      pin_memory=(device.type == 'cuda'), drop_last=False)
 
 
 # =============================================================================
@@ -188,7 +248,7 @@ def make_fit_loader(train_loader, val_loader, batch_size, num_workers, device, i
 def _torch_load(path, device):
     try:
         return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
+    except TypeError:          # very old torch without the weights_only argument
         return torch.load(path, map_location=device)
 
 
@@ -196,22 +256,31 @@ def import_pruned_architecture():
     try:
         from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError as e:
-        raise ImportError('Cannot import ResNet_50_pruned_hardfakevsreal') from e
+        raise ImportError('Cannot import ResNet_50_pruned_hardfakevsreal from model.ResNet_pruned. '
+                          'Make sure the `model` package is in the working directory or on PYTHONPATH.') from e
     return ResNet_50_pruned_hardfakevsreal
 
 
-def load_checkpoint(path, device, is_main):
+def load_checkpoint(path, device):
+    """Returns (model in eval mode on `device`, training history dict or None)."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f'Checkpoint not found: {path}')
     try:
         ckpt = _torch_load(path, 'cpu')
     except Exception as load_err:
-        raise RuntimeError(f"Could not load '{path}': {load_err}") from load_err
+        try:
+            ckpt = torch.jit.load(path, map_location=device)
+        except Exception:
+            raise RuntimeError(
+                f"Could not load '{path}': {load_err}\n"
+                f"If the checkpoint is a fully pickled model, the model class definition must be "
+                f"importable in this script.") from load_err
 
     history, model = None, None
     if isinstance(ckpt, nn.Module):
         model = ckpt
     elif isinstance(ckpt, dict) and 'masks' in ckpt and 'model_state_dict' in ckpt:
+        # pruned ResNet-50 checkpoint: {'masks': ..., 'model_state_dict': ..., [optional 'history']}
         history = ckpt.get('history')
         arch_cls = import_pruned_architecture()
         model = arch_cls(masks=ckpt['masks'])
@@ -224,12 +293,15 @@ def load_checkpoint(path, device, is_main):
                 model = cand
                 break
     if model is None:
-        raise RuntimeError(f"'{path}' does not contain a usable model.")
-    model = model.to(device).eval()
+        raise RuntimeError(f"'{path}' does not contain a full torch.nn.Module (only weights?). "
+                           f"The pruned architecture is required; save the whole model object.")
+    model = model.to(device)
+    model.eval()
     return model, history
 
 
 def build_forward(model, mean, std, device):
+    """Callable: raw image batch in [0,1] -> model output (per-model normalization applied)."""
     mean_t = torch.tensor(mean, dtype=torch.float32, device=device).view(1, 3, 1, 1)
     std_t = torch.tensor(std, dtype=torch.float32, device=device).view(1, 3, 1, 1)
     try:
@@ -243,6 +315,7 @@ def build_forward(model, mean, std, device):
 
 
 def standardize_output(out):
+    """Model output -> tensor of shape (B,) [single logit/prob] or (B, 2) [two classes]."""
     if isinstance(out, (tuple, list)):
         out = out[0]
     if out.dim() == 0:
@@ -253,96 +326,22 @@ def standardize_output(out):
         return out[:, 0]
     if out.dim() == 2 and out.shape[1] == 2:
         return out
-    raise ValueError(f'Unsupported model output shape {tuple(out.shape)}')
+    raise ValueError(f'Unsupported model output shape {tuple(out.shape)}; expected (B,), (B,1) or (B,2).')
 
 
-# =============================================================================
-# Distributed inference helpers
-# =============================================================================
 @torch.no_grad()
-def collect_outputs_ddp(forward, loader, device, is_main):
-    """Collect raw outputs + labels across all ranks and gather on rank 0."""
+def collect_outputs(forward, loader, device):
     raws, labels = [], []
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
         out = standardize_output(forward(images))
         raws.append(out.detach().float().cpu())
         labels.append(targets.detach().cpu())
-
-    local_raw = torch.cat(raws, dim=0) if raws else torch.empty(0)
-    local_lab = torch.cat(labels, dim=0) if labels else torch.empty(0, dtype=torch.long)
-
-    if not dist.is_initialized():
-        return local_raw, local_lab.numpy().astype(np.int64)
-
-    local_len = torch.tensor([local_raw.size(0)], device=device)
-    all_lens = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(dist.get_world_size())]
-    dist.all_gather(all_lens, local_len)
-    all_lens = [int(x.item()) for x in all_lens]
-    max_len = max(all_lens)
-
-    if local_raw.dim() == 1:
-        pad_raw = torch.zeros(max_len, dtype=local_raw.dtype)
-    else:
-        pad_raw = torch.zeros(max_len, local_raw.size(1), dtype=local_raw.dtype)
-    pad_lab = torch.zeros(max_len, dtype=torch.long)
-
-    if local_raw.size(0) > 0:
-        pad_raw[:local_raw.size(0)] = local_raw
-        pad_lab[:local_lab.size(0)] = local_lab
-
-    pad_raw = pad_raw.to(device)
-    pad_lab = pad_lab.to(device)
-
-    gathered_raw = [torch.zeros_like(pad_raw) for _ in range(dist.get_world_size())]
-    gathered_lab = [torch.zeros_like(pad_lab) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered_raw, pad_raw)
-    dist.all_gather(gathered_lab, pad_lab)
-
-    if is_main:
-        final_raw, final_lab = [], []
-        for r, l, ln in zip(gathered_raw, gathered_lab, all_lens):
-            final_raw.append(r[:ln].cpu())
-            final_lab.append(l[:ln].cpu())
-        return torch.cat(final_raw, dim=0), torch.cat(final_lab, dim=0).numpy().astype(np.int64)
-    else:
-        return torch.empty(0), np.array([], dtype=np.int64)
+    return torch.cat(raws, dim=0), torch.cat(labels, dim=0).numpy().astype(np.int64)
 
 
-@torch.no_grad()
-def evaluate_single_model_ddp(forward, loader, device, name, is_main):
-    """
-    Simple-Averaging-style single-model evaluation.
-    Each rank computes local accuracy, all_reduce sums them.
-    """
-    correct = 0
-    total = 0
-    for images, labels in loader:
-        images = images.to(device, non_blocking=True)
-        out = standardize_output(forward(images))
-        # Raw output -> probability of Real
-        raw = out.float()
-        # assume single logit (most pruned ResNet models output a single logit)
-        prob = torch.sigmoid(raw) if raw.dim() == 1 else torch.softmax(raw, dim=1)[:, 1]
-        pred = (prob > 0.5).long()
-        correct += pred.eq(labels.to(device).long()).sum().item()
-        total += labels.size(0)
-
-    correct_t = torch.tensor(correct, dtype=torch.long, device=device)
-    total_t = torch.tensor(total, dtype=torch.long, device=device)
-    if dist.is_initialized():
-        dist.all_reduce(correct_t, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_t, op=dist.ReduceOp.SUM)
-    acc = 100.0 * correct_t.item() / total_t.item() if total_t.item() > 0 else 0.0
-    if is_main:
-        print(f' {name}: {acc:.2f}%')
-    return acc
-
-
-# =============================================================================
-# Output kind detection
-# =============================================================================
 def infer_output_kind(raw):
+    """Decide (once, on the whole data) whether raw outputs are logits or probabilities."""
     raw = raw.double()
     in_unit = bool(raw.min() >= 0.0) and bool(raw.max() <= 1.0)
     if raw.dim() == 1:
@@ -353,6 +352,7 @@ def infer_output_kind(raw):
 
 
 def raw_to_prob_real(raw, kind):
+    """Raw output -> P(real) in [0, 1]  (real = class 1)."""
     if kind == 'logit_single':
         return torch.sigmoid(raw)
     if kind == 'prob_single':
@@ -364,19 +364,96 @@ def raw_to_prob_real(raw, kind):
     raise ValueError(f'Unknown output kind: {kind}')
 
 
+# ---------------------------------------------------------------------------
+# Parallel inference across GPUs
+# ---------------------------------------------------------------------------
+def parallel_collect_outputs(forwards, models, args, fit_base_loader, test_base_loader, devices, model_names):
+    """
+    For every model i:
+      * runs inference on the train-fit loader  -> (raw_fit_i, y_fit_i)
+      * runs inference on the test loader       -> (raw_test_i, y_test_i)
+    All models are executed concurrently in one thread per model, each thread pinned to its
+    assigned CUDA device (round-robin).  Returns four lists in model order.
+    """
+    n = len(forwards)
+    raw_fit = [None] * n
+    raw_test = [None] * n
+    y_fit_all = [None] * n
+    y_test_all = [None] * n
+    errors = [None] * n
+
+    # resolve worker count for the per-thread loaders; keep the user's value but ensure
+    # we don't spawn num_workers threads x models (could oversubscribe the machine)
+    per_thread_workers = max(0, args.num_workers)
+
+    def worker(idx):
+        try:
+            model = models[idx]
+            device = next(model.parameters()).device     # device assigned to this model
+            if device.type == 'cuda':
+                torch.cuda.set_device(device)
+
+            # fresh loaders so concurrent iteration is safe
+            fit_loader = make_thread_loader(fit_base_loader, args.batch_size, device,
+                                            per_thread_workers)
+            test_loader = make_thread_loader(test_base_loader, args.batch_size, device,
+                                             per_thread_workers)
+
+            print(f'[{model_names[idx]}] (device {device}) inference on train split '
+                  f'({len(fit_loader.dataset)} images) ...')
+            rf, yf = collect_outputs(forwards[idx], fit_loader, device)
+            print(f'[{model_names[idx]}] (device {device}) inference on test split '
+                  f'({len(test_loader.dataset)} images) ...')
+            rt, yt = collect_outputs(forwards[idx], test_loader, device)
+
+            raw_fit[idx], y_fit_all[idx] = rf, yf
+            raw_test[idx], y_test_all[idx] = rt, yt
+        except Exception as e:
+            errors[idx] = e
+
+    threads = [threading.Thread(target=worker, args=(i,), name=f'infer-{model_names[i]}')
+               for i in range(n)]
+    t0 = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+    import time
+    wall_start = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    wall_elapsed = time.time() - wall_start
+
+    for i, err in enumerate(errors):
+        if err is not None:
+            raise RuntimeError(f'Inference failed for model {model_names[i]}: {err}') from err
+
+    print(f'\n[multi-gpu] parallel inference finished in {wall_elapsed:.1f}s '
+          f'(wall clock, {n} models across {len(devices)} device(s)).')
+
+    return raw_fit, raw_test, y_fit_all, y_test_all
+
+
 # =============================================================================
-# Choquet + GA
+# Choquet fuzzy integral + genetic algorithm (paper, Section 3)
 # =============================================================================
 def choquet_integral(scores, g):
+    """
+    Discrete Choquet integral of 3 classifier scores (paper Eq. (5)/(6)).
+    scores : (N, 3) tensor in [0, 1]  -> columns = x1, x2, x3
+    g      : tensor [g{x1}, g{x2}, g{x3}, g{x1,x2}, g{x1,x3}, g{x2,x3}]  (g{}=0, g{x1,x2,x3}=1)
+
+    Scores are sorted in descending order s1 >= s2 >= s3, F_i = set of the i largest scores:
+        integral = s1*g(F1) + s2*[g(F2) - g(F1)] + s3*[g(F3) - g(F2)],   g(F3) = 1
+    """
     s, order = torch.sort(scores, dim=1, descending=True)
     g_single = g[0:3]
-    g_pair_without = torch.stack([g[5], g[4], g[3]])
-    g_f1 = g_single[order[:, 0]]
-    g_f2 = g_pair_without[order[:, 2]]
+    g_pair_without = torch.stack([g[5], g[4], g[3]])      # pair left after removing x1 / x2 / x3
+    g_f1 = g_single[order[:, 0]]                          # set containing the largest score
+    g_f2 = g_pair_without[order[:, 2]]                    # the two largest = all but the smallest
     return s[:, 0] * g_f1 + s[:, 1] * (g_f2 - g_f1) + s[:, 2] * (1.0 - g_f2)
 
 
 def repair_individual(ind):
+    """Project a candidate onto the feasible set: 0<=g<=1 and g{xi,xj} > g{xi}+g{xj} (Eq. 1)."""
     g = np.clip(np.asarray(ind, dtype=np.float64), 0.0, 1.0)
     singles, pairs = g[:3].copy(), g[3:].copy()
     limit = 1.0 - FUZZY_EPS
@@ -398,76 +475,69 @@ def is_feasible(g):
 
 
 def fit_fuzzy_measure_ga(scores, labels_bool, pop_size, max_iter, early_stopping,
-                         p_cross, p_mut, tournament_size, seed, is_main):
-    if is_main:
-        rng = np.random.RandomState(seed)
+                         p_cross, p_mut, tournament_size, seed):
+    """
+    Genetic algorithm that learns the fuzzy measures (paper Fig. 4).
+    scores      : (N, 3) float64 tensor, detector outputs P(real) on the training split
+    labels_bool : (N,) bool tensor, True = real
+    Fitness = correct classification rate of the Choquet output thresholded at 0.5.
+    Crossover (Eq. 2): h1 = 0.5*(C1 + C2), h2 = 1.5*C1 - 0.5*C2.
+    Mutation  (Eq. 3): C_m = h_i +/- r/4, r ~ U(0, 1).
+    """
+    rng = np.random.RandomState(seed)
 
-        def fitness(ind):
-            out = choquet_integral(scores, torch.from_numpy(ind))
-            return (out > 0.5).eq(labels_bool).double().mean().item()
+    def fitness(ind):
+        out = choquet_integral(scores, torch.from_numpy(ind))
+        return (out > 0.5).eq(labels_bool).double().mean().item()
 
-        def random_individual():
-            singles = rng.uniform(0.0, 0.5, size=3)
-            pairs = [rng.uniform(singles[i] + singles[j] + FUZZY_EPS, 1.0) for i, j in PAIR_INDICES]
-            return repair_individual(np.concatenate([singles, pairs]))
+    def random_individual():
+        singles = rng.uniform(0.0, 0.5, size=3)
+        pairs = [rng.uniform(singles[i] + singles[j] + FUZZY_EPS, 1.0) for i, j in PAIR_INDICES]
+        return repair_individual(np.concatenate([singles, pairs]))
 
-        def tournament(pop, fits):
-            idx = rng.randint(0, len(pop), size=tournament_size)
-            return pop[idx[int(np.argmax(fits[idx]))]]
+    def tournament(pop, fits):
+        idx = rng.randint(0, len(pop), size=tournament_size)
+        return pop[idx[int(np.argmax(fits[idx]))]]
 
-        pop = np.stack([random_individual() for _ in range(pop_size)])
-        fits = np.array([fitness(ind) for ind in pop])
-        best_i = int(np.argmax(fits))
-        best, best_fit = pop[best_i].copy(), float(fits[best_i])
-        stall = 0
-        print(f'  GA init : best train accuracy = {best_fit * 100:.2f}%')
+    pop = np.stack([random_individual() for _ in range(pop_size)])
+    fits = np.array([fitness(ind) for ind in pop])
+    best_i = int(np.argmax(fits))
+    best, best_fit = pop[best_i].copy(), float(fits[best_i])
+    stall = 0
+    print(f'  GA init : best train accuracy = {best_fit * 100:.2f}%')
 
-        for gen in range(1, max_iter + 1):
-            children = [best.copy()]
-            while len(children) < pop_size:
-                p1, p2 = tournament(pop, fits), tournament(pop, fits)
-                if rng.rand() < p_cross:
-                    c1, c2 = 0.5 * (p1 + p2), 1.5 * p1 - 0.5 * p2
-                else:
-                    c1, c2 = p1.copy(), p2.copy()
-                for c in (c1, c2):
-                    if rng.rand() < p_mut:
-                        c = c + rng.choice([-1.0, 1.0], size=c.shape) * rng.rand(*c.shape) / 4.0
-                    children.append(repair_individual(c))
-            pop = np.stack(children[:pop_size])
-            fits = np.array([fitness(ind) for ind in pop])
-            gen_best_i = int(np.argmax(fits))
-            if fits[gen_best_i] > best_fit + 1e-12:
-                best, best_fit = pop[gen_best_i].copy(), float(fits[gen_best_i])
-                stall = 0
+    for gen in range(1, max_iter + 1):
+        children = [best.copy()]                          # elitism
+        while len(children) < pop_size:
+            p1, p2 = tournament(pop, fits), tournament(pop, fits)
+            if rng.rand() < p_cross:
+                c1, c2 = 0.5 * (p1 + p2), 1.5 * p1 - 0.5 * p2
             else:
-                stall += 1
-            print(f'  GA gen {gen:02d}: best train accuracy = {best_fit * 100:.2f}% (stall {stall}/{early_stopping})')
-            if stall >= early_stopping:
-                print(f'  GA early stopping at generation {gen}.')
-                break
+                c1, c2 = p1.copy(), p2.copy()
+            for c in (c1, c2):
+                if rng.rand() < p_mut:
+                    c = c + rng.choice([-1.0, 1.0], size=c.shape) * rng.rand(*c.shape) / 4.0
+                children.append(repair_individual(c))
+        pop = np.stack(children[:pop_size])
+        fits = np.array([fitness(ind) for ind in pop])
+        gen_best_i = int(np.argmax(fits))
+        if fits[gen_best_i] > best_fit + 1e-12:
+            best, best_fit = pop[gen_best_i].copy(), float(fits[gen_best_i])
+            stall = 0
+        else:
+            stall += 1
+        print(f'  GA gen {gen:02d}: best train accuracy = {best_fit * 100:.2f}% (stall {stall}/{early_stopping})')
+        if stall >= early_stopping:
+            print(f'  GA early stopping at generation {gen}.')
+            break
 
-        if not is_feasible(best):
-            raise RuntimeError('GA produced an infeasible fuzzy measure.')
-        g_best = best
-        ga_acc = best_fit
-    else:
-        g_best = np.zeros(6, dtype=np.float64)
-        ga_acc = 0.0
-
-    if dist.is_initialized():
-        g_t = torch.from_numpy(g_best).float().cuda() if torch.cuda.is_available() else torch.from_numpy(g_best).float()
-        dist.broadcast(g_t, src=0)
-        g_best = g_t.cpu().numpy()
-        acc_t = torch.tensor([ga_acc], dtype=torch.float64, device=g_t.device)
-        dist.broadcast(acc_t, src=0)
-        ga_acc = float(acc_t.item())
-
-    return g_best, ga_acc
+    if not is_feasible(best):
+        raise RuntimeError('GA produced an infeasible fuzzy measure (internal error).')
+    return best, best_fit
 
 
 # =============================================================================
-# Metrics / reporting (rank 0 only)
+# Metrics / reporting
 # =============================================================================
 def safe_div(num, den):
     return float(num) / float(den) if den > 0 else 0.0
@@ -478,15 +548,19 @@ def compute_metrics(y_true, y_pred):
     fp = int(np.sum((y_true == 0) & (y_pred == 1)))
     tn = int(np.sum((y_true == 0) & (y_pred == 0)))
     fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+
     precision_real = safe_div(tp, tp + fp)
     recall_real = safe_div(tp, tp + fn)
     f1_real = safe_div(2 * precision_real * recall_real, precision_real + recall_real)
+
     precision_fake = safe_div(tn, tn + fn)
     recall_fake = safe_div(tn, tn + fp)
     f1_fake = safe_div(2 * precision_fake * recall_fake, precision_fake + recall_fake)
     acc = safe_div(tp + tn, tp + tn + fp + fn) * 100.0
+
     return {
-        'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn, 'acc': acc,
+        'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
+        'acc': acc,
         'precision_real': precision_real, 'recall_real': recall_real, 'f1_real': f1_real,
         'precision_fake': precision_fake, 'recall_fake': recall_fake, 'f1_fake': f1_fake,
         'macro_precision': (precision_real + precision_fake) / 2,
@@ -499,14 +573,17 @@ def compute_metrics(y_true, y_pred):
 def print_metrics_table(name, dataset, m):
     line = '=' * 70
     print(f'\n{line}')
-    print(f'METRICS | model: {name} | dataset: {dataset} | Real=1, Fake=0')
+    print(f'METRICS | model: {name} | dataset: {dataset} | Real=1 (positive), Fake=0')
     print(line)
-    print(f"TP={m['tp']}  FP={m['fp']}  TN={m['tn']}  FN={m['fn']}")
+    print(f"TP={m['tp']}  FP={m['fp']}  TN={m['tn']}  FN={m['fn']}  "
+          f"(total={m['tp'] + m['fp'] + m['tn'] + m['fn']})")
     print(f"{'Metric':<22}{'Value':>12}")
     print('-' * 34)
+
     print(f"{'accuracy (%)':<22}{m['acc']:>12.2f}")
     for key in METRIC_KEYS:
         print(f'{key:<22}{m[key]:>12.4f}')
+
     print(f"{'balanced_acc (%)':<22}{m['balanced_acc']:>12.2f}")
     print(line)
 
@@ -519,17 +596,21 @@ def write_results_txt(path, y_true, y_score, y_pred):
 
 
 def plot_confusion_matrix(m, name, dataset, save_dir):
-    cm = np.array([[m['tn'], m['fp']], [m['fn'], m['tp']]], dtype=np.int64)
+    cm = np.array([[m['tn'], m['fp']],
+                   [m['fn'], m['tp']]], dtype=np.int64)       # rows: true Fake/Real, cols: pred Fake/Real
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(cm, cmap='Blues')
-    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
-    ax.set_xticklabels(['Fake', 'Real']); ax.set_yticklabels(['Fake', 'Real'])
-    ax.set_xlabel('Predicted'); ax.set_ylabel('True')
-    ax.set_title(f'Confusion Matrix - {name} on {dataset}')
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(['Fake', 'Real'], fontsize=12)
+    ax.set_yticklabels(['Fake', 'Real'], fontsize=12)
+    ax.set_xlabel('Predicted label', fontsize=12)
+    ax.set_ylabel('True label', fontsize=12)
+    ax.set_title(f'Confusion Matrix - {name} on {dataset}', fontsize=14)
     thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
     for i in range(2):
         for j in range(2):
-            ax.text(j, i, f'{int(cm[i, j]):,}', ha='center', va='center',
+            ax.text(j, i, f'{int(cm[i, j]):,}', ha='center', va='center', fontsize=14,
                     color='white' if cm[i, j] > thresh else 'black')
     fig.colorbar(im, ax=ax)
     fig.tight_layout()
@@ -540,19 +621,19 @@ def plot_confusion_matrix(m, name, dataset, save_dir):
 
 
 def evaluate_and_report(name, dataset, y_true, y_score, save_dir):
-    y_pred = (y_score > 0.5).astype(np.int64)
+    y_pred = (y_score > 0.5).astype(np.int64)             # > 0.5 -> real (1), otherwise fake (0)
     m = compute_metrics(y_true, y_pred)
     print_metrics_table(name, dataset, m)
     txt_path = os.path.join(save_dir, f'{dataset}_{name}_test_results.txt')
     write_results_txt(txt_path, y_true, y_score, y_pred)
     cm_path = plot_confusion_matrix(m, name, dataset, save_dir)
-    print(f'Saved: {txt_path}')
-    print(f'Saved: {cm_path}')
+    print(f'Saved test results (y_true / y_score / y_pred): {txt_path}')
+    print(f'Saved confusion matrix: {cm_path}')
     return m
 
 
 # =============================================================================
-# Training curves
+# Training curves (from the 'history' stored inside a checkpoint, if any)
 # =============================================================================
 def prepare_history(history, requested_epochs):
     if not isinstance(history, dict):
@@ -567,9 +648,14 @@ def prepare_history(history, requested_epochs):
     except (TypeError, ValueError):
         return None, 0
     available = min(len(v) for v in series.values())
-    num_epochs = min(requested_epochs, available) if requested_epochs else available
+    num_epochs = available
+    if requested_epochs is not None:
+        if requested_epochs > available:
+            print(f'  [warning] --epochs={requested_epochs} but the history has only {available} epochs; '
+                  f'plotting {available}.')
+        num_epochs = min(requested_epochs, available)
     series = {k: v[:num_epochs] for k, v in series.items()}
-    if max(series['train_acc'] + series['val_acc']) <= 1.0:
+    if max(series['train_acc'] + series['val_acc']) <= 1.0:      # fractions -> percent
         series['train_acc'] = [v * 100.0 for v in series['train_acc']]
         series['val_acc'] = [v * 100.0 for v in series['val_acc']]
     return series, num_epochs
@@ -577,23 +663,36 @@ def prepare_history(history, requested_epochs):
 
 def plot_training_curves(history, num_epochs, save_dir, model_name):
     plt.figure(figsize=(14, 6))
+
+    # Loss
     plt.subplot(1, 2, 1)
-    plt.plot(range(1, num_epochs + 1), history['train_loss'], label='train', color='blue')
-    plt.plot(range(1, num_epochs + 1), history['val_loss'], label='val', color='orange')
-    plt.title('Loss'); plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend(); plt.grid(True, alpha=0.7)
+    plt.plot(range(1, num_epochs + 1), history['train_loss'], label='train', color='blue', linewidth=2)
+    plt.plot(range(1, num_epochs + 1), history['val_loss'], label='validation', color='orange', linewidth=2)
+    plt.title('Loss', fontsize=16)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
+
+    # Accuracy
     plt.subplot(1, 2, 2)
-    plt.plot(range(1, num_epochs + 1), history['train_acc'], label='train', color='blue')
-    plt.plot(range(1, num_epochs + 1), history['val_acc'], label='val', color='orange')
-    plt.title('Accuracy'); plt.xlabel('Epoch'); plt.ylabel('Accuracy (%)'); plt.legend(); plt.grid(True, alpha=0.7)
+    plt.plot(range(1, num_epochs + 1), history['train_acc'], label='train', color='blue', linewidth=2)
+    plt.plot(range(1, num_epochs + 1), history['val_acc'], label='validation', color='orange', linewidth=2)
+    plt.title('Accuracy', fontsize=16)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Accuracy (%)', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
+
     plt.tight_layout()
-    path = os.path.join(save_dir, f'training_curves_{model_name}.png')
-    plt.savefig(path, dpi=300, bbox_inches='tight')
+    curves_path = os.path.join(save_dir, f'training_curves_{model_name}.png')
+    plt.savefig(curves_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f'Training curves saved: {path}')
+    print(f"Training curves (Loss & Acc) saved to: {curves_path}")
 
 
 # =============================================================================
-# Ensemble class + benchmark adapter
+# Efficiency: latency / throughput / computational time (efficiency_utils.benchmark_efficiency)
 # =============================================================================
 class MultiModelNormalization(nn.Module):
     def __init__(self, means, stds):
@@ -607,6 +706,10 @@ class MultiModelNormalization(nn.Module):
 
 
 class NoRouter(nn.Module):
+    """
+    Stand-in for the `hesitant_fuzzy` router expected by efficiency_utils. The Choquet ensemble has no
+    routing network (all models always run), so this returns weight 1 for every model.
+    """
     def __init__(self, num_models):
         super().__init__()
         self.num_models = num_models
@@ -616,6 +719,11 @@ class NoRouter(nn.Module):
 
 
 class ChoquetEnsemble(nn.Module):
+    """
+    Choquet fuzzy-integral ensemble exposing the interface used by efficiency_utils:
+      .models, .normalizations(x, i), .hesitant_fuzzy(x), forward(x) -> (fused_score, weights)
+    fused_score = Choquet integral of the three P(real) scores (shape (B,)); weights = ones (B, M).
+    """
     def __init__(self, models, means, stds, kinds, g):
         super().__init__()
         self.num_models = len(models)
@@ -639,67 +747,39 @@ class ChoquetEnsemble(nn.Module):
         return fused, weights
 
 
-class _ChoquetBenchmarkAdapter(nn.Module):
-    """Adapter so `benchmark_efficiency` (HFDE API) can be used with ChoquetEnsemble."""
-    def __init__(self, ensemble: ChoquetEnsemble):
-        super().__init__()
-        self.ensemble = ensemble
-        self.models = ensemble.models
-        self.normalizations = ensemble.normalizations
-        self.num_models = ensemble.num_models
-
-    def eval(self):
-        self.ensemble.eval()
-        return self
-
-    def hesitant_fuzzy(self, x):
-        return torch.ones(x.size(0), self.num_models, device=x.device)
-
-    def forward(self, x):
-        out, w = self.ensemble(x)
-        return out, w
-
-
-def run_efficiency(ensemble, names, test_loader, device, save_dir, latency_samples, is_main):
-    if not is_main:
-        return None
-    adapter = _ChoquetBenchmarkAdapter(ensemble).to(device)
-    adapter.eval()
-
+def run_efficiency(ensemble, names, test_loader, device, save_dir, latency_samples):
     n_total = len(test_loader.dataset)
     n_lat = n_total if latency_samples is None else min(latency_samples, n_total)
+    if n_lat > 5000:
+        print(f'[note] latency benchmark uses {n_lat} test images cached on the GPU; '
+              f'use --latency_samples to reduce memory/time if this is too heavy.')
 
-    results = benchmark_efficiency(
-        adapter, test_loader, device, names,
-        latency_samples=n_lat, verbose=True,
-    )
+    # latency (bs=1), throughput (batched) and full-test-pass time for the ensemble and every single model
+    results = eff.benchmark_efficiency(ensemble, test_loader, device, names,
+                                       latency_samples=n_lat, verbose=True)
 
-    # Rename HFDE labels to Choquet labels
-    if 'HFDE (dynamic)' in results.get('methods', {}):
-        results['methods']['Choquet ensemble'] = results['methods'].pop('HFDE (dynamic)')
-    results.get('methods', {}).pop('Router only', None)
-    if 'full_test_pass_hfde' in results:
-        results['full_test_pass'] = results.pop('full_test_pass_hfde')
-    results['method'] = 'Choquet Fuzzy Integral'
-
-    # Also get per-single-model compute times via measure_full_pass
+    # computational time of every single model on the whole test set (model compute only)
     singles = {}
-    print('\nComputational time of each single model:')
+    print('\nComputational time of each single model on the whole test set '
+          f'(mean of {FULL_PASS_REPEATS} passes):')
     for i, name in enumerate(names):
-        fn = (lambda x, i=i: standardize_output(
-            ensemble.models[i](ensemble.normalizations(x, i))))
+        fn = (lambda x, i=i: ensemble.models[i](ensemble.normalizations(x, i)))
         fp = eff.measure_full_pass(fn, test_loader, device, repeats=FULL_PASS_REPEATS)
         singles[name] = fp
-        print(f"  {name:<24} {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f} s")
+        print(f"  {name:<24} model compute {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f} s "
+              f"({fp['img_per_s_compute']:.1f} img/s) | end-to-end incl. data loading {fp['total_time_s']:.2f} s")
     results['full_test_pass_single_models'] = singles
 
+    print('\n(In the summary below, "HFDE" is the label used by efficiency_utils; here it is the '
+          'Choquet ensemble, which always runs all models.)')
+    eff.print_headline(results)
+
     report_path = os.path.join(save_dir, 'efficiency_report.json')
-    with open(report_path, 'w') as f:
+    with open(report_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, default=str)
     print(f'Efficiency report saved: {report_path}')
     if device.type == 'cuda':
         torch.cuda.empty_cache()
-    return results
 
 
 # =============================================================================
@@ -707,250 +787,132 @@ def run_efficiency(ensemble, names, test_loader, device, save_dir, latency_sampl
 # =============================================================================
 def main():
     args = parse_args()
-    device, local_rank, rank, world_size = setup_distributed()
-    is_main = is_main_process(rank)
-    is_distributed = world_size > 1
-
-    if is_main:
-        os.makedirs(args.save_dir, exist_ok=True)
-
+    os.makedirs(args.save_dir, exist_ok=True)
     set_seed(args.seed)
 
-    # ---- Pipeline Stopwatch (Simple-Averaging style) ----
-    pipeline_sw = Stopwatch(device).start()
+    # ---- device setup (multi-GPU aware) ----
+    devices = resolve_devices(args.gpus)
+    primary_device = devices[0]                     # device used for the ensemble / benchmark
+    if primary_device.type == 'cuda':
+        torch.cuda.set_device(primary_device)
 
-    if is_main:
-        print('=' * 70)
-        print('Choquet Fuzzy Integral Ensemble (Multi-GPU ready)')
-        print(f'Distributed on {world_size} GPU(s) | Seed: {args.seed}')
-        print('=' * 70)
-        print(f'  dataset={args.dataset} | batch_size={args.batch_size}')
-        print(f'  GA: pop={args.ga_pop_size}, max_iter={args.ga_max_iter}')
-        for n, p in zip(args.model_names, args.model_paths):
-            print(f'  model {n}: {p}')
+    print('=' * 70)
+    print('Configuration')
+    print('=' * 70)
+    print(f'  dataset={args.dataset} | data_dir={args.data_dir} | batch_size={args.batch_size} | '
+          f'seed={args.seed} | epochs={args.epochs} | num_workers={args.num_workers}')
+    print(f'  GA: pop_size={args.ga_pop_size}, max_iter={args.ga_max_iter}, '
+          f'early_stopping={args.ga_early_stopping}, crossover_prob={args.ga_crossover_prob}, '
+          f'mutation_prob={args.ga_mutation_prob}, tournament_size={args.ga_tournament_size}')
+    print(f'  devices={[str(d) for d in devices]} | primary={primary_device} | save_dir={args.save_dir}')
+    for n, p in zip(args.model_names, args.model_paths):
+        print(f'  model {n}: {p}')
 
-    # ---- Data ----
+    # ---- data (user's dataset_utils) --------------------------------------
+    # For the parallel inference phase we build the DataLoaders on the primary device;
+    # each worker thread will create its own loader pinned to its own device.
     train_loader, val_loader, test_loader = create_dataloaders(
         base_dir=args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers,
-        dataset_type=args.dataset, is_distributed=is_distributed, seed=args.seed, is_main=is_main)
+        dataset_type=args.dataset, is_distributed=False, seed=args.seed, is_main=True)
+    if len(test_loader.dataset) == 0:
+        raise RuntimeError('The test split is empty.')
+    check_label_convention(test_loader.dataset)
+    fit_loader = make_fit_loader(train_loader, val_loader, args.batch_size, args.num_workers, primary_device)
 
-    if is_main:
-        check_label_convention(test_loader.dataset)
-
-    fit_loader = make_fit_loader(train_loader, val_loader, args.batch_size,
-                                 args.num_workers, device, is_distributed, args.seed)
-
-    # ---- Models ----
+    # ---- models: load each one on its assigned device -----------------------
     models, forwards, histories = [], [], []
+    print('\n' + '=' * 70)
+    print('Loading models and assigning GPUs (round-robin)')
+    print('=' * 70)
     for i, (name, path) in enumerate(zip(args.model_names, args.model_paths)):
-        if is_main:
-            print(f'\nLoading model {name} ...')
-        model, history = load_checkpoint(path, device, is_main)
+        dev = device_for_model(i, devices)
+        print(f'  [{i}] {name}  ->  {dev}')
+        model, history = load_checkpoint(path, dev)
         models.append(model)
-        forwards.append(build_forward(model, DEFAULT_MEANS[i], DEFAULT_STDS[i], device))
+        forwards.append(build_forward(model, DEFAULT_MEANS[i], DEFAULT_STDS[i], dev))
         histories.append(history)
 
-    barrier()
+    # ---- parallel inference on train split + test split ---------------------
+    print('\n' + '=' * 70)
+    print('Parallel inference across devices')
+    print('=' * 70)
+    raw_fit, raw_test, y_fit_all, y_test_all = parallel_collect_outputs(
+        forwards, models, args, fit_loader, test_loader, devices, args.model_names,
+    )
 
-    # ---- Individual model evaluation (Simple-Averaging style) ----
-    if is_main:
-        print('\n' + '=' * 70)
-        print('INDIVIDUAL MODEL PERFORMANCE')
-        print('=' * 70)
-
-    individual_accs = []
-    individual_times = []
+    # consistency check on labels
+    y_fit_ref, y_test_ref = y_fit_all[0], y_test_all[0]
     for i, name in enumerate(args.model_names):
-        sw = Stopwatch(device).start()
-        acc = evaluate_single_model_ddp(forwards[i], test_loader, device,
-                                        f'Model {i+1} ({name})', is_main)
-        t = sw.stop()
-        individual_accs.append(acc)
-        individual_times.append(t)
-        if is_main:
-            print(f' ⏱ Evaluation time: {t:.1f}s\n')
+        if not (np.array_equal(y_fit_all[i], y_fit_ref) and np.array_equal(y_test_all[i], y_test_ref)):
+            raise RuntimeError(f'Label order differs for model {name} (data loader is not deterministic).')
+    validate_binary_labels(y_fit_ref, 'Train')
+    validate_binary_labels(y_test_ref, 'Test')
 
-    best_single = max(individual_accs) if individual_accs else 0.0
-    best_idx = individual_accs.index(best_single) if individual_accs else 0
-    if is_main:
-        print(f'\nBest Single: Model {best_idx+1} '
-              f'({args.model_names[best_idx]}) → {best_single:.2f}%')
-
-    # ---- Inference on train + test (distributed) ----
-    raw_fit, raw_test = [], []
-    y_fit_ref, y_test_ref = None, None
-
+    kinds, prob_fit, prob_test = [], [], []
     for i, name in enumerate(args.model_names):
-        if is_main:
-            print(f'\n[{name}] inference on train split ...')
-        rf, yf = collect_outputs_ddp(forwards[i], fit_loader, device, is_main)
+        both = torch.cat([raw_fit[i], raw_test[i]], dim=0)
+        if not bool(torch.isfinite(both).all()):
+            raise RuntimeError(f'Model {name} produced non-finite outputs.')
+        kind = infer_output_kind(both)
+        kinds.append(kind)
+        print(f'[{name}] output interpreted as: {OUTPUT_KIND_DESC[kind]}')
+        prob_fit.append(raw_to_prob_real(raw_fit[i].double(), kind))
+        prob_test.append(raw_to_prob_real(raw_test[i].double(), kind))
 
-        if is_main:
-            print(f'[{name}] inference on test split ...')
-        rt, yt = collect_outputs_ddp(forwards[i], test_loader, device, is_main)
+    # ---- gather every model on the primary device for the ensemble ----------
+    # (efficiency_utils.benchmark_efficiency expects a single-device ensemble)
+    print(f'\n[multi-gpu] moving all models to primary device {primary_device} for the ensemble.')
+    for m in models:
+        m.to(primary_device)
+    if primary_device.type == 'cuda':
+        torch.cuda.empty_cache()
 
-        if is_main:
-            if y_fit_ref is None:
-                y_fit_ref, y_test_ref = yf, yt
-            else:
-                if not (np.array_equal(yf, y_fit_ref) and np.array_equal(yt, y_test_ref)):
-                    raise RuntimeError('Label order differs between models.')
-            raw_fit.append(rf)
-            raw_test.append(rt)
-
-    barrier()
-
-    # From here only rank 0 does GA + metrics + saving
-    if is_main:
-        validate_binary_labels(y_fit_ref, 'Train')
-        validate_binary_labels(y_test_ref, 'Test')
-
-        kinds, prob_fit, prob_test = [], [], []
-        for i, name in enumerate(args.model_names):
-            both = torch.cat([raw_fit[i], raw_test[i]], dim=0)
-            if not bool(torch.isfinite(both).all()):
-                raise RuntimeError(f'Model {name} produced non-finite outputs.')
-            kind = infer_output_kind(both)
-            kinds.append(kind)
-            print(f'[{name}] output interpreted as: {OUTPUT_KIND_DESC[kind]}')
-            prob_fit.append(raw_to_prob_real(raw_fit[i].double(), kind))
-            prob_test.append(raw_to_prob_real(raw_test[i].double(), kind))
-
-        scores_fit = torch.stack(prob_fit, dim=1)
-        scores_test = torch.stack(prob_test, dim=1)
-        labels_fit = torch.from_numpy(y_fit_ref == 1)
-
-        print('\n' + '=' * 70)
-        print('Learning Choquet fuzzy measures with GA (train split)')
-        print('=' * 70)
-    else:
-        kinds = ['logit_single'] * len(args.model_names)
-        scores_fit = torch.empty(0, 3)
-        scores_test = torch.empty(0, 3)
-        labels_fit = torch.empty(0, dtype=torch.bool)
-        y_test_ref = np.array([])
-        prob_test = [torch.empty(0) for _ in args.model_names]
-
-    # ---- GA ----
-    ga_sw = Stopwatch(device).start() if is_main else None
+    # ---- Choquet fuzzy integral: learn g with the GA on the train split -----
+    scores_fit = torch.stack(prob_fit, dim=1)                  # (N_train, 3) float64
+    scores_test = torch.stack(prob_test, dim=1)                # (N_test, 3)  float64
+    labels_fit = torch.from_numpy(y_fit_ref == 1)              # bool, True = real
+    print('\n' + '=' * 70)
+    print('Learning the Choquet fuzzy measures with the genetic algorithm (train split)')
+    print('=' * 70)
     g_best, ga_acc = fit_fuzzy_measure_ga(
-        scores_fit if is_main else torch.empty(0, 3),
-        labels_fit if is_main else torch.empty(0, dtype=torch.bool),
-        args.ga_pop_size, args.ga_max_iter, args.ga_early_stopping,
-        args.ga_crossover_prob, args.ga_mutation_prob, args.ga_tournament_size,
-        args.seed, is_main)
-    ga_time = ga_sw.stop() if is_main else 0.0
+        scores_fit, labels_fit, args.ga_pop_size, args.ga_max_iter, args.ga_early_stopping,
+        args.ga_crossover_prob, args.ga_mutation_prob, args.ga_tournament_size, args.seed)
+    names = args.model_names
+    print(f'\nLearned fuzzy measures (x1={names[0]}, x2={names[1]}, x3={names[2]}); train accuracy {ga_acc * 100:.2f}%')
+    print(f'  g{{}}         = 0')
+    print(f'  g{{x1}}       = {g_best[0]:.7f}')
+    print(f'  g{{x2}}       = {g_best[1]:.7f}')
+    print(f'  g{{x3}}       = {g_best[2]:.7f}')
+    print(f'  g{{x1,x2}}    = {g_best[3]:.7f}')
+    print(f'  g{{x1,x3}}    = {g_best[4]:.7f}')
+    print(f'  g{{x2,x3}}    = {g_best[5]:.7f}')
+    print(f'  g{{x1,x2,x3}} = 1')
 
-    barrier()
+    g_t = torch.from_numpy(g_best)
+    fused_test = choquet_integral(scores_test, g_t).numpy()
 
-    if is_main:
-        names = args.model_names
-        print(f'\nLearned fuzzy measures (train acc {ga_acc * 100:.2f}%)')
-        print(f'  g{{x1}}={g_best[0]:.6f}  g{{x2}}={g_best[1]:.6f}  g{{x3}}={g_best[2]:.6f}')
-        print(f'  g{{x1,x2}}={g_best[3]:.6f}  g{{x1,x3}}={g_best[4]:.6f}  g{{x2,x3}}={g_best[5]:.6f}')
+    # ---- metrics / txt files / confusion matrices ---------------------------
+    evaluations = [(name, prob_test[i].numpy()) for i, name in enumerate(args.model_names)]
+    evaluations.append((ENSEMBLE_NAME, fused_test))
+    for name, y_score in evaluations:
+        evaluate_and_report(name, args.dataset, y_test_ref, y_score, args.save_dir)
 
-        g_t = torch.from_numpy(g_best)
-        fused_test = choquet_integral(scores_test, g_t).numpy()
+    # ---- training curves -----------------------------------------------------
+    print()
+    for name, history in zip(args.model_names, histories):
+        series, num_epochs = prepare_history(history, args.epochs)
+        if series is None:
+            print(f"[{name}] no training history (keys {list(HISTORY_KEYS)} under 'history') found in the "
+                  f"checkpoint -> training curves skipped.")
+        else:
+            plot_training_curves(series, num_epochs, args.save_dir, name)
 
-        # ---- Final ensemble evaluation (timed) ----
-        ensemble_sw = Stopwatch(device).start()
-        evaluations = [(name, prob_test[i].numpy()) for i, name in enumerate(args.model_names)]
-        evaluations.append((ENSEMBLE_NAME, fused_test))
+    # ---- efficiency (single-device ensemble on the primary GPU) -------------
+    ensemble = ChoquetEnsemble(models, DEFAULT_MEANS, DEFAULT_STDS, kinds, g_best).to(primary_device)
+    ensemble.eval()
+    run_efficiency(ensemble, args.model_names, test_loader, primary_device, args.save_dir, args.latency_samples)
 
-        report_metrics = {}
-        for name, y_score in evaluations:
-            report_metrics[name] = evaluate_and_report(
-                name, args.dataset, y_test_ref, y_score, args.save_dir)
-        ensemble_eval_time = ensemble_sw.stop()
-        print(f'\n⏱ Final ensemble evaluation time: {ensemble_eval_time:.1f}s')
-
-        # ---- Training curves ----
-        for name, history in zip(args.model_names, histories):
-            series, num_epochs = prepare_history(history, args.epochs)
-            if series is not None:
-                plot_training_curves(series, num_epochs, args.save_dir, name)
-
-        # ---- Efficiency benchmark ----
-        ensemble = ChoquetEnsemble(models, DEFAULT_MEANS, DEFAULT_STDS, kinds, g_best).to(device)
-        ensemble.eval()
-        bench_sw = Stopwatch(device).start()
-        efficiency = run_efficiency(ensemble, args.model_names, test_loader, device,
-                                    args.save_dir, args.latency_samples, is_main)
-        bench_time = bench_sw.stop()
-
-        # ---- FINAL COMPARISON ----
-        final_acc = report_metrics[ENSEMBLE_NAME]['acc']
-        print('\n' + '=' * 70)
-        print('FINAL COMPARISON')
-        print('=' * 70)
-        print(f'Best Single Model: {best_single:.2f}%')
-        print(f'Choquet Ensemble : {final_acc:.2f}%')
-        print(f'Improvement      : {final_acc - best_single:+.2f}%')
-        print('=' * 70)
-
-        # ---- TIME SUMMARY ----
-        total_pipeline_time = pipeline_sw.stop()
-        print('\n' + '=' * 70)
-        print('TIME SUMMARY')
-        print('=' * 70)
-        for i, name in enumerate(args.model_names):
-            print(f'  Model {i+1} ({name}) evaluation : {individual_times[i]:.1f}s')
-        print(f'  GA training                   : {ga_time:.1f}s')
-        print(f'  Efficiency benchmark          : {bench_time:.1f}s')
-        print(f'  Final ensemble evaluation     : {ensemble_eval_time:.1f}s')
-        print(f'  Total pipeline time           : {total_pipeline_time/60:.2f} min '
-              f'({total_pipeline_time:.1f}s)')
-        print('=' * 70)
-
-        # ---- Save final results ----
-        final_results = {
-            'seed': args.seed,
-            'method': 'Choquet Fuzzy Integral',
-            'dataset': args.dataset,
-            'best_single_model': {
-                'name': args.model_names[best_idx],
-                'accuracy': float(best_single),
-            },
-            'ensemble': {
-                'test_accuracy': float(final_acc),
-                'fuzzy_measures': {
-                    'g_x1': float(g_best[0]), 'g_x2': float(g_best[1]), 'g_x3': float(g_best[2]),
-                    'g_x1x2': float(g_best[3]), 'g_x1x3': float(g_best[4]), 'g_x2x3': float(g_best[5]),
-                },
-                'ga_train_accuracy': float(ga_acc),
-            },
-            'improvement': float(final_acc - best_single),
-            'metrics_per_model': report_metrics,
-            'timing': {
-                'individual_model_eval_times_s': {
-                    name: float(t) for name, t in zip(args.model_names, individual_times)
-                },
-                'ga_time_s': float(ga_time),
-                'benchmark_time_s': float(bench_time),
-                'ensemble_eval_time_s': float(ensemble_eval_time),
-                'total_pipeline_time_s': float(total_pipeline_time),
-            },
-        }
-        with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
-            json.dump(final_results, f, indent=2, default=str)
-
-        # Save model
-        final_model_path = os.path.join(args.save_dir, 'final_choquet_model.pt')
-        torch.save({
-            'ensemble_state_dict': ensemble.state_dict(),
-            'test_accuracy': final_acc,
-            'model_names': args.model_names,
-            'means': DEFAULT_MEANS,
-            'stds': DEFAULT_STDS,
-            'kinds': kinds,
-            'g_best': g_best.tolist(),
-            'seed': args.seed,
-        }, final_model_path)
-        print(f'Model saved: {final_model_path}')
-
-        print(f'\nAll outputs saved to: {os.path.abspath(args.save_dir)}')
-
-    cleanup_distributed()
+    print(f'All outputs were saved to: {os.path.abspath(args.save_dir)}')
 
 
 if __name__ == '__main__':
