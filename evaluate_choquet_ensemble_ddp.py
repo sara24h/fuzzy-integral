@@ -1,18 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
+Choquet Fuzzy Integral Ensemble — Multi-GPU (mirrors Simple Averaging parallelism).
 Labeling convention: Real = 1 (positive class), Fake = 0 (negative class).
-Paper implementation (Section 3):
-  * every detector outputs a number in [0, 1]  (here: P(real));
-  * the three outputs are fused with the Choquet fuzzy integral;
-  * the fuzzy measures g{x1}, g{x2}, g{x3}, g{x1,x2}, g{x1,x3}, g{x2,x3} are learned on the
-    TRAINING split with a genetic algorithm (pop_size=16, max_iter=50, early_stopping=10,
-    crossover prob 0.7, mutation prob 0.3, crossover = Eq. (2), mutation = Eq. (3),
-    fitness = correct-classification rate, super-additive constraint = Eq. (1),
-    g{} = 0 and g{x1,x2,x3} = 1);
-  * fused value  < 0.5 -> fake,   fused value > 0.5 -> real.
-
-Multi-GPU ready (torchrun / DDP-style evaluation).
 """
 import os
 import sys
@@ -35,6 +25,7 @@ for _p in (_HERE, os.getcwd()):
         sys.path.insert(0, _p)
 
 import efficiency_utils as eff
+from efficiency_utils import Stopwatch, benchmark_efficiency
 from dataset_utils import create_dataloaders
 
 # =============================================================================
@@ -49,7 +40,7 @@ DEFAULT_MODEL_PATHS = [
     '/kaggle/input/models/saraaskari/190k-pearson-pruned/pytorch/default/1/190k_pearson_pruned.pt',
 ]
 DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
 ENSEMBLE_NAME = 'choquet_ensemble'
 FULL_PASS_REPEATS = 3
 FUZZY_EPS = 1e-6
@@ -124,7 +115,7 @@ def parse_args():
     args = p.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
-        p.error(f'--model_names and --model_paths must have the same length.')
+        p.error('--model_names and --model_paths must have the same length.')
     if len(args.model_names) != len(DEFAULT_MEANS):
         p.error(f'Exactly {len(DEFAULT_MEANS)} models are expected.')
     if len(set(args.model_names)) != len(args.model_names):
@@ -177,10 +168,8 @@ def validate_binary_labels(y, split_name):
 
 
 def make_fit_loader(train_loader, val_loader, batch_size, num_workers, device, is_distributed, seed):
-    """Deterministic loader over TRAIN split for learning fuzzy measures."""
     fit_ds = copy.copy(train_loader.dataset)
     fit_ds.transform = val_loader.dataset.transform
-
     if is_distributed:
         from torch.utils.data.distributed import DistributedSampler
         sampler = DistributedSampler(fit_ds, shuffle=False, seed=seed)
@@ -267,6 +256,9 @@ def standardize_output(out):
     raise ValueError(f'Unsupported model output shape {tuple(out.shape)}')
 
 
+# =============================================================================
+# Distributed inference helpers
+# =============================================================================
 @torch.no_grad()
 def collect_outputs_ddp(forward, loader, device, is_main):
     """Collect raw outputs + labels across all ranks and gather on rank 0."""
@@ -283,14 +275,12 @@ def collect_outputs_ddp(forward, loader, device, is_main):
     if not dist.is_initialized():
         return local_raw, local_lab.numpy().astype(np.int64)
 
-    # Gather lengths first
     local_len = torch.tensor([local_raw.size(0)], device=device)
     all_lens = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(dist.get_world_size())]
     dist.all_gather(all_lens, local_len)
     all_lens = [int(x.item()) for x in all_lens]
     max_len = max(all_lens)
 
-    # Pad and gather
     if local_raw.dim() == 1:
         pad_raw = torch.zeros(max_len, dtype=local_raw.dtype)
     else:
@@ -319,6 +309,39 @@ def collect_outputs_ddp(forward, loader, device, is_main):
         return torch.empty(0), np.array([], dtype=np.int64)
 
 
+@torch.no_grad()
+def evaluate_single_model_ddp(forward, loader, device, name, is_main):
+    """
+    Simple-Averaging-style single-model evaluation.
+    Each rank computes local accuracy, all_reduce sums them.
+    """
+    correct = 0
+    total = 0
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        out = standardize_output(forward(images))
+        # Raw output -> probability of Real
+        raw = out.float()
+        # assume single logit (most pruned ResNet models output a single logit)
+        prob = torch.sigmoid(raw) if raw.dim() == 1 else torch.softmax(raw, dim=1)[:, 1]
+        pred = (prob > 0.5).long()
+        correct += pred.eq(labels.to(device).long()).sum().item()
+        total += labels.size(0)
+
+    correct_t = torch.tensor(correct, dtype=torch.long, device=device)
+    total_t = torch.tensor(total, dtype=torch.long, device=device)
+    if dist.is_initialized():
+        dist.all_reduce(correct_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_t, op=dist.ReduceOp.SUM)
+    acc = 100.0 * correct_t.item() / total_t.item() if total_t.item() > 0 else 0.0
+    if is_main:
+        print(f' {name}: {acc:.2f}%')
+    return acc
+
+
+# =============================================================================
+# Output kind detection
+# =============================================================================
 def infer_output_kind(raw):
     raw = raw.double()
     in_unit = bool(raw.min() >= 0.0) and bool(raw.max() <= 1.0)
@@ -376,7 +399,6 @@ def is_feasible(g):
 
 def fit_fuzzy_measure_ga(scores, labels_bool, pop_size, max_iter, early_stopping,
                          p_cross, p_mut, tournament_size, seed, is_main):
-    """GA runs only on rank 0. Result is broadcast to all ranks."""
     if is_main:
         rng = np.random.RandomState(seed)
 
@@ -433,7 +455,6 @@ def fit_fuzzy_measure_ga(scores, labels_bool, pop_size, max_iter, early_stopping
         g_best = np.zeros(6, dtype=np.float64)
         ga_acc = 0.0
 
-    # Broadcast result to all ranks
     if dist.is_initialized():
         g_t = torch.from_numpy(g_best).float().cuda() if torch.cuda.is_available() else torch.from_numpy(g_best).float()
         dist.broadcast(g_t, src=0)
@@ -531,7 +552,7 @@ def evaluate_and_report(name, dataset, y_true, y_score, save_dir):
 
 
 # =============================================================================
-# Training curves + Efficiency (rank 0 only)
+# Training curves
 # =============================================================================
 def prepare_history(history, requested_epochs):
     if not isinstance(history, dict):
@@ -571,6 +592,9 @@ def plot_training_curves(history, num_epochs, save_dir, model_name):
     print(f'Training curves saved: {path}')
 
 
+# =============================================================================
+# Ensemble class + benchmark adapter
+# =============================================================================
 class MultiModelNormalization(nn.Module):
     def __init__(self, means, stds):
         super().__init__()
@@ -615,28 +639,67 @@ class ChoquetEnsemble(nn.Module):
         return fused, weights
 
 
+class _ChoquetBenchmarkAdapter(nn.Module):
+    """Adapter so `benchmark_efficiency` (HFDE API) can be used with ChoquetEnsemble."""
+    def __init__(self, ensemble: ChoquetEnsemble):
+        super().__init__()
+        self.ensemble = ensemble
+        self.models = ensemble.models
+        self.normalizations = ensemble.normalizations
+        self.num_models = ensemble.num_models
+
+    def eval(self):
+        self.ensemble.eval()
+        return self
+
+    def hesitant_fuzzy(self, x):
+        return torch.ones(x.size(0), self.num_models, device=x.device)
+
+    def forward(self, x):
+        out, w = self.ensemble(x)
+        return out, w
+
+
 def run_efficiency(ensemble, names, test_loader, device, save_dir, latency_samples, is_main):
     if not is_main:
-        return
+        return None
+    adapter = _ChoquetBenchmarkAdapter(ensemble).to(device)
+    adapter.eval()
+
     n_total = len(test_loader.dataset)
     n_lat = n_total if latency_samples is None else min(latency_samples, n_total)
-    results = eff.benchmark_efficiency(ensemble, test_loader, device, names,
-                                       latency_samples=n_lat, verbose=True)
+
+    results = benchmark_efficiency(
+        adapter, test_loader, device, names,
+        latency_samples=n_lat, verbose=True,
+    )
+
+    # Rename HFDE labels to Choquet labels
+    if 'HFDE (dynamic)' in results.get('methods', {}):
+        results['methods']['Choquet ensemble'] = results['methods'].pop('HFDE (dynamic)')
+    results.get('methods', {}).pop('Router only', None)
+    if 'full_test_pass_hfde' in results:
+        results['full_test_pass'] = results.pop('full_test_pass_hfde')
+    results['method'] = 'Choquet Fuzzy Integral'
+
+    # Also get per-single-model compute times via measure_full_pass
     singles = {}
     print('\nComputational time of each single model:')
     for i, name in enumerate(names):
-        fn = (lambda x, i=i: ensemble.models[i](ensemble.normalizations(x, i)))
+        fn = (lambda x, i=i: standardize_output(
+            ensemble.models[i](ensemble.normalizations(x, i))))
         fp = eff.measure_full_pass(fn, test_loader, device, repeats=FULL_PASS_REPEATS)
         singles[name] = fp
         print(f"  {name:<24} {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f} s")
     results['full_test_pass_single_models'] = singles
-    eff.print_headline(results)
+
     report_path = os.path.join(save_dir, 'efficiency_report.json')
     with open(report_path, 'w') as f:
         json.dump(results, f, indent=2, default=str)
     print(f'Efficiency report saved: {report_path}')
     if device.type == 'cuda':
         torch.cuda.empty_cache()
+    return results
 
 
 # =============================================================================
@@ -652,6 +715,9 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
 
     set_seed(args.seed)
+
+    # ---- Pipeline Stopwatch (Simple-Averaging style) ----
+    pipeline_sw = Stopwatch(device).start()
 
     if is_main:
         print('=' * 70)
@@ -686,6 +752,30 @@ def main():
 
     barrier()
 
+    # ---- Individual model evaluation (Simple-Averaging style) ----
+    if is_main:
+        print('\n' + '=' * 70)
+        print('INDIVIDUAL MODEL PERFORMANCE')
+        print('=' * 70)
+
+    individual_accs = []
+    individual_times = []
+    for i, name in enumerate(args.model_names):
+        sw = Stopwatch(device).start()
+        acc = evaluate_single_model_ddp(forwards[i], test_loader, device,
+                                        f'Model {i+1} ({name})', is_main)
+        t = sw.stop()
+        individual_accs.append(acc)
+        individual_times.append(t)
+        if is_main:
+            print(f' ⏱ Evaluation time: {t:.1f}s\n')
+
+    best_single = max(individual_accs) if individual_accs else 0.0
+    best_idx = individual_accs.index(best_single) if individual_accs else 0
+    if is_main:
+        print(f'\nBest Single: Model {best_idx+1} '
+              f'({args.model_names[best_idx]}) → {best_single:.2f}%')
+
     # ---- Inference on train + test (distributed) ----
     raw_fit, raw_test = [], []
     y_fit_ref, y_test_ref = None, None
@@ -710,7 +800,7 @@ def main():
 
     barrier()
 
-    # From here only rank 0 continues with GA + metrics + saving
+    # From here only rank 0 does GA + metrics + saving
     if is_main:
         validate_binary_labels(y_fit_ref, 'Train')
         validate_binary_labels(y_test_ref, 'Test')
@@ -733,7 +823,6 @@ def main():
         print('\n' + '=' * 70)
         print('Learning Choquet fuzzy measures with GA (train split)')
         print('=' * 70)
-
     else:
         kinds = ['logit_single'] * len(args.model_names)
         scores_fit = torch.empty(0, 3)
@@ -742,13 +831,15 @@ def main():
         y_test_ref = np.array([])
         prob_test = [torch.empty(0) for _ in args.model_names]
 
-    # GA (only rank 0 computes, then broadcasts)
+    # ---- GA ----
+    ga_sw = Stopwatch(device).start() if is_main else None
     g_best, ga_acc = fit_fuzzy_measure_ga(
         scores_fit if is_main else torch.empty(0, 3),
         labels_fit if is_main else torch.empty(0, dtype=torch.bool),
         args.ga_pop_size, args.ga_max_iter, args.ga_early_stopping,
         args.ga_crossover_prob, args.ga_mutation_prob, args.ga_tournament_size,
         args.seed, is_main)
+    ga_time = ga_sw.stop() if is_main else 0.0
 
     barrier()
 
@@ -761,23 +852,101 @@ def main():
         g_t = torch.from_numpy(g_best)
         fused_test = choquet_integral(scores_test, g_t).numpy()
 
+        # ---- Final ensemble evaluation (timed) ----
+        ensemble_sw = Stopwatch(device).start()
         evaluations = [(name, prob_test[i].numpy()) for i, name in enumerate(args.model_names)]
         evaluations.append((ENSEMBLE_NAME, fused_test))
 
+        report_metrics = {}
         for name, y_score in evaluations:
-            evaluate_and_report(name, args.dataset, y_test_ref, y_score, args.save_dir)
+            report_metrics[name] = evaluate_and_report(
+                name, args.dataset, y_test_ref, y_score, args.save_dir)
+        ensemble_eval_time = ensemble_sw.stop()
+        print(f'\n⏱ Final ensemble evaluation time: {ensemble_eval_time:.1f}s')
 
-        # Training curves
+        # ---- Training curves ----
         for name, history in zip(args.model_names, histories):
             series, num_epochs = prepare_history(history, args.epochs)
             if series is not None:
                 plot_training_curves(series, num_epochs, args.save_dir, name)
 
-        # Efficiency
+        # ---- Efficiency benchmark ----
         ensemble = ChoquetEnsemble(models, DEFAULT_MEANS, DEFAULT_STDS, kinds, g_best).to(device)
         ensemble.eval()
-        run_efficiency(ensemble, args.model_names, test_loader, device,
-                       args.save_dir, args.latency_samples, is_main)
+        bench_sw = Stopwatch(device).start()
+        efficiency = run_efficiency(ensemble, args.model_names, test_loader, device,
+                                    args.save_dir, args.latency_samples, is_main)
+        bench_time = bench_sw.stop()
+
+        # ---- FINAL COMPARISON ----
+        final_acc = report_metrics[ENSEMBLE_NAME]['acc']
+        print('\n' + '=' * 70)
+        print('FINAL COMPARISON')
+        print('=' * 70)
+        print(f'Best Single Model: {best_single:.2f}%')
+        print(f'Choquet Ensemble : {final_acc:.2f}%')
+        print(f'Improvement      : {final_acc - best_single:+.2f}%')
+        print('=' * 70)
+
+        # ---- TIME SUMMARY ----
+        total_pipeline_time = pipeline_sw.stop()
+        print('\n' + '=' * 70)
+        print('TIME SUMMARY')
+        print('=' * 70)
+        for i, name in enumerate(args.model_names):
+            print(f'  Model {i+1} ({name}) evaluation : {individual_times[i]:.1f}s')
+        print(f'  GA training                   : {ga_time:.1f}s')
+        print(f'  Efficiency benchmark          : {bench_time:.1f}s')
+        print(f'  Final ensemble evaluation     : {ensemble_eval_time:.1f}s')
+        print(f'  Total pipeline time           : {total_pipeline_time/60:.2f} min '
+              f'({total_pipeline_time:.1f}s)')
+        print('=' * 70)
+
+        # ---- Save final results ----
+        final_results = {
+            'seed': args.seed,
+            'method': 'Choquet Fuzzy Integral',
+            'dataset': args.dataset,
+            'best_single_model': {
+                'name': args.model_names[best_idx],
+                'accuracy': float(best_single),
+            },
+            'ensemble': {
+                'test_accuracy': float(final_acc),
+                'fuzzy_measures': {
+                    'g_x1': float(g_best[0]), 'g_x2': float(g_best[1]), 'g_x3': float(g_best[2]),
+                    'g_x1x2': float(g_best[3]), 'g_x1x3': float(g_best[4]), 'g_x2x3': float(g_best[5]),
+                },
+                'ga_train_accuracy': float(ga_acc),
+            },
+            'improvement': float(final_acc - best_single),
+            'metrics_per_model': report_metrics,
+            'timing': {
+                'individual_model_eval_times_s': {
+                    name: float(t) for name, t in zip(args.model_names, individual_times)
+                },
+                'ga_time_s': float(ga_time),
+                'benchmark_time_s': float(bench_time),
+                'ensemble_eval_time_s': float(ensemble_eval_time),
+                'total_pipeline_time_s': float(total_pipeline_time),
+            },
+        }
+        with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
+            json.dump(final_results, f, indent=2, default=str)
+
+        # Save model
+        final_model_path = os.path.join(args.save_dir, 'final_choquet_model.pt')
+        torch.save({
+            'ensemble_state_dict': ensemble.state_dict(),
+            'test_accuracy': final_acc,
+            'model_names': args.model_names,
+            'means': DEFAULT_MEANS,
+            'stds': DEFAULT_STDS,
+            'kinds': kinds,
+            'g_best': g_best.tolist(),
+            'seed': args.seed,
+        }, final_model_path)
+        print(f'Model saved: {final_model_path}')
 
         print(f'\nAll outputs saved to: {os.path.abspath(args.save_dir)}')
 
