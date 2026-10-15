@@ -73,9 +73,9 @@ def setup_distributed():
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
         local_rank = int(os.environ['LOCAL_RANK'])
-        dist.init_process_group(backend='nccl')
-        torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl', device_id=device)
         if rank == 0:
             print(f'Distributed: rank {rank}/{world_size}, local_rank {local_rank}')
         return device, local_rank, rank, world_size
@@ -95,7 +95,7 @@ def is_main_process(rank):
 
 def barrier():
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(device_ids=[torch.cuda.current_device()])
 
 
 # =============================================================================
