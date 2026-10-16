@@ -1,6 +1,24 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+Labeling convention: Real = 1 (positive class), Fake = 0 (negative class).
 
+Paper implementation (Section 3):
+  * every detector outputs a number in [0, 1]  (here: P(real));
+  * the three outputs are fused with the Choquet fuzzy integral;
+  * the fuzzy measures g{x1}, g{x2}, g{x3}, g{x1,x2}, g{x1,x3}, g{x2,x3} are learned on the
+    TRAINING split with a genetic algorithm (pop_size=16, max_iter=50, early_stopping=10,
+    crossover prob 0.7, mutation prob 0.3, crossover = Eq. (2), mutation = Eq. (3),
+    fitness = correct-classification rate, super-additive constraint = Eq. (1),
+    g{} = 0 and g{x1,x2,x3} = 1);
+  * fused value  < 0.5 -> fake,   fused value > 0.5 -> real.
+
+Multi-GPU:
+  Run with   torchrun --nproc_per_node=2 this_script.py --dataset ... --data_dir ...
+  Inference on the train/test splits is sharded across the GPUs (one process per GPU) and the
+  outputs are gathered back in the original order. Everything after that (GA, metrics, plots,
+  efficiency benchmark) runs on rank 0 / GPU 0 only. Without torchrun it runs on a single GPU as before.
+"""
 
 import os
 import sys
@@ -8,12 +26,13 @@ import copy
 import json
 import random
 import argparse
-import threading
+from datetime import timedelta
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Subset
 
 import matplotlib
 matplotlib.use('Agg')
@@ -105,10 +124,6 @@ def parse_args():
     p.add_argument('--ga_mutation_prob', type=float, default=0.3, help='GA mutation probability.')
     p.add_argument('--ga_tournament_size', type=int, default=3,
                    help='GA tournament selection size (paper does not specify; default 3).')
-    # ---- NEW: multi-GPU control ----
-    p.add_argument('--gpus', type=int, nargs='+', default=None,
-                   help='GPU indices to use (e.g. --gpus 0 1). Default: all visible CUDA devices. '
-                        'Pass --gpus -1 to force CPU.')
     args = p.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -133,6 +148,7 @@ def parse_args():
         p.error('--ga_max_iter and --ga_early_stopping must be >= 1.')
     if not (0.0 <= args.ga_crossover_prob <= 1.0 and 0.0 <= args.ga_mutation_prob <= 1.0):
         p.error('GA probabilities must lie in [0, 1].')
+
     if args.ga_tournament_size < 2:
         p.error('--ga_tournament_size must be >= 2.')
     if args.ga_tournament_size > args.ga_pop_size:
@@ -151,51 +167,46 @@ def set_seed(seed):
 
 
 # =============================================================================
-# Multi-GPU helpers
+# Multi-GPU helpers (torchrun: one process per GPU)
 # =============================================================================
-def resolve_devices(requested_gpus):
+def setup_distributed():
     """
-    Return the list of torch.device objects to spread models over.
-      * requested_gpus is None      -> every visible CUDA device (or CPU if none)
-      * requested_gpus == [-1]      -> force CPU
-      * requested_gpus == [0, 1]    -> cuda:0, cuda:1 (validated)
+    Returns (rank, world_size, local_rank). If not launched with torchrun (or world_size == 1),
+    returns (0, 1, 0) and nothing is initialised.
+    The 'gloo' backend is used only for gathering the (small) output tensors on CPU; the models
+    themselves run on the GPUs, so no NCCL is needed.
     """
-    if requested_gpus is not None and requested_gpus == [-1]:
-        return [torch.device('cpu')]
-    if not torch.cuda.is_available():
-        print('[multi-gpu] CUDA not available, running on CPU.')
-        return [torch.device('cpu')]
-
-    num_visible = torch.cuda.device_count()
-    if requested_gpus is None:
-        ids = list(range(num_visible))
-    else:
-        for g in requested_gpus:
-            if g < 0 or g >= num_visible:
-                raise ValueError(f'--gpus contains {g}, but only {num_visible} CUDA device(s) '
-                                 f'are visible (0..{num_visible - 1}).')
-        ids = list(requested_gpus)
-
-    devices = [torch.device(f'cuda:{i}') for i in ids]
-    print(f'[multi-gpu] using devices: {[str(d) for d in devices]}')
-    return devices
+    world = int(os.environ.get('WORLD_SIZE', '1'))
+    if world > 1 and 'RANK' in os.environ:
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ.get('LOCAL_RANK', rank))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='gloo', timeout=timedelta(hours=2))
+        return rank, world, local_rank
+    return 0, 1, 0
 
 
-def device_for_model(idx, devices):
-    """Round-robin assignment: model i -> devices[i % len(devices)]."""
-    return devices[idx % len(devices)]
+def make_shard_loader(loader, rank, world, num_workers, device):
+    """Deterministic loader over the strided shard rank, rank+world, rank+2*world, ... of loader.dataset."""
+    ds = loader.dataset
+    shard = Subset(ds, list(range(rank, len(ds), world)))
+    return DataLoader(shard, batch_size=loader.batch_size, shuffle=False, num_workers=num_workers,
+                      pin_memory=(device.type == 'cuda'), drop_last=False)
 
 
-def make_thread_loader(base_loader, batch_size, device, num_workers):
-    """
-    Build a fresh DataLoader for a worker thread.  We use a copy of the dataset so that
-    concurrent iteration is completely independent of the caller's loader.
-    """
-    ds = copy.copy(base_loader.dataset)
-    return DataLoader(
-        ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=(device.type == 'cuda'), drop_last=False,
-    )
+def gather_in_order(raw, labels, n_total, world):
+    """All-gather the shard outputs and put them back in the original dataset order."""
+    if world == 1:
+        return raw, labels
+    parts = [None] * world
+    dist.all_gather_object(parts, (raw, labels))
+    full_raw = torch.empty((n_total,) + tuple(raw.shape[1:]), dtype=raw.dtype)
+    full_lab = np.empty(n_total, dtype=np.int64)
+    for r, (pr, pl) in enumerate(parts):
+        full_raw[r::world] = pr
+        full_lab[r::world] = pl
+    return full_raw, full_lab
 
 
 # =============================================================================
@@ -340,6 +351,18 @@ def collect_outputs(forward, loader, device):
     return torch.cat(raws, dim=0), torch.cat(labels, dim=0).numpy().astype(np.int64)
 
 
+def collect_outputs_parallel(forward, loader, device, rank, world, num_workers):
+    """
+    Same result as collect_outputs(forward, loader, device) but the dataset is sharded across the
+    `world` processes (GPUs); the outputs are gathered back in the original dataset order.
+    """
+    if world == 1:
+        return collect_outputs(forward, loader, device)
+    shard_loader = make_shard_loader(loader, rank, world, num_workers, device)
+    raw, labels = collect_outputs(forward, shard_loader, device)
+    return gather_in_order(raw, labels, len(loader.dataset), world)
+
+
 def infer_output_kind(raw):
     """Decide (once, on the whole data) whether raw outputs are logits or probabilities."""
     raw = raw.double()
@@ -362,74 +385,6 @@ def raw_to_prob_real(raw, kind):
     if kind == 'prob_two':
         return raw[:, 1]
     raise ValueError(f'Unknown output kind: {kind}')
-
-
-# ---------------------------------------------------------------------------
-# Parallel inference across GPUs
-# ---------------------------------------------------------------------------
-def parallel_collect_outputs(forwards, models, args, fit_base_loader, test_base_loader, devices, model_names):
-    """
-    For every model i:
-      * runs inference on the train-fit loader  -> (raw_fit_i, y_fit_i)
-      * runs inference on the test loader       -> (raw_test_i, y_test_i)
-    All models are executed concurrently in one thread per model, each thread pinned to its
-    assigned CUDA device (round-robin).  Returns four lists in model order.
-    """
-    n = len(forwards)
-    raw_fit = [None] * n
-    raw_test = [None] * n
-    y_fit_all = [None] * n
-    y_test_all = [None] * n
-    errors = [None] * n
-
-    # resolve worker count for the per-thread loaders; keep the user's value but ensure
-    # we don't spawn num_workers threads x models (could oversubscribe the machine)
-    per_thread_workers = max(0, args.num_workers)
-
-    def worker(idx):
-        try:
-            model = models[idx]
-            device = next(model.parameters()).device     # device assigned to this model
-            if device.type == 'cuda':
-                torch.cuda.set_device(device)
-
-            # fresh loaders so concurrent iteration is safe
-            fit_loader = make_thread_loader(fit_base_loader, args.batch_size, device,
-                                            per_thread_workers)
-            test_loader = make_thread_loader(test_base_loader, args.batch_size, device,
-                                             per_thread_workers)
-
-            print(f'[{model_names[idx]}] (device {device}) inference on train split '
-                  f'({len(fit_loader.dataset)} images) ...')
-            rf, yf = collect_outputs(forwards[idx], fit_loader, device)
-            print(f'[{model_names[idx]}] (device {device}) inference on test split '
-                  f'({len(test_loader.dataset)} images) ...')
-            rt, yt = collect_outputs(forwards[idx], test_loader, device)
-
-            raw_fit[idx], y_fit_all[idx] = rf, yf
-            raw_test[idx], y_test_all[idx] = rt, yt
-        except Exception as e:
-            errors[idx] = e
-
-    threads = [threading.Thread(target=worker, args=(i,), name=f'infer-{model_names[i]}')
-               for i in range(n)]
-    t0 = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
-    import time
-    wall_start = time.time()
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    wall_elapsed = time.time() - wall_start
-
-    for i, err in enumerate(errors):
-        if err is not None:
-            raise RuntimeError(f'Inference failed for model {model_names[i]}: {err}') from err
-
-    print(f'\n[multi-gpu] parallel inference finished in {wall_elapsed:.1f}s '
-          f'(wall clock, {n} models across {len(devices)} device(s)).')
-
-    return raw_fit, raw_test, y_fit_all, y_test_all
 
 
 # =============================================================================
@@ -583,7 +538,7 @@ def print_metrics_table(name, dataset, m):
     print(f"{'accuracy (%)':<22}{m['acc']:>12.2f}")
     for key in METRIC_KEYS:
         print(f'{key:<22}{m[key]:>12.4f}')
-
+    
     print(f"{'balanced_acc (%)':<22}{m['balanced_acc']:>12.2f}")
     print(line)
 
@@ -688,7 +643,7 @@ def plot_training_curves(history, num_epochs, save_dir, model_name):
     curves_path = os.path.join(save_dir, f'training_curves_{model_name}.png')
     plt.savefig(curves_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Training curves (Loss & Acc) saved to: {curves_path}")
+    print(f"✅ Training curves (Loss & Acc) saved to: {curves_path}")
 
 
 # =============================================================================
@@ -790,61 +745,74 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     set_seed(args.seed)
 
-    # ---- device setup (multi-GPU aware) ----
-    devices = resolve_devices(args.gpus)
-    primary_device = devices[0]                     # device used for the ensemble / benchmark
-    if primary_device.type == 'cuda':
-        torch.cuda.set_device(primary_device)
+    rank, world, local_rank = setup_distributed()
+    is_main = (rank == 0)
 
-    print('=' * 70)
-    print('Configuration')
-    print('=' * 70)
-    print(f'  dataset={args.dataset} | data_dir={args.data_dir} | batch_size={args.batch_size} | '
-          f'seed={args.seed} | epochs={args.epochs} | num_workers={args.num_workers}')
-    print(f'  GA: pop_size={args.ga_pop_size}, max_iter={args.ga_max_iter}, '
-          f'early_stopping={args.ga_early_stopping}, crossover_prob={args.ga_crossover_prob}, '
-          f'mutation_prob={args.ga_mutation_prob}, tournament_size={args.ga_tournament_size}')
-    print(f'  devices={[str(d) for d in devices]} | primary={primary_device} | save_dir={args.save_dir}')
-    for n, p in zip(args.model_names, args.model_paths):
-        print(f'  model {n}: {p}')
+    if torch.cuda.is_available():
+        device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device('cpu')
+
+    if is_main:
+        print('=' * 70)
+        print('Configuration')
+        print('=' * 70)
+        print(f'  dataset={args.dataset} | data_dir={args.data_dir} | batch_size={args.batch_size} | '
+              f'seed={args.seed} | epochs={args.epochs} | num_workers={args.num_workers}')
+        print(f'  GA: pop_size={args.ga_pop_size}, max_iter={args.ga_max_iter}, '
+              f'early_stopping={args.ga_early_stopping}, crossover_prob={args.ga_crossover_prob}, '
+              f'mutation_prob={args.ga_mutation_prob}, tournament_size={args.ga_tournament_size}')
+        print(f'  device={device} | world_size={world} (inference is sharded across {world} process(es)) '
+              f'| save_dir={args.save_dir}')
+        for n, p in zip(args.model_names, args.model_paths):
+            print(f'  model {n}: {p}')
 
     # ---- data (user's dataset_utils) --------------------------------------
-    # For the parallel inference phase we build the DataLoaders on the primary device;
-    # each worker thread will create its own loader pinned to its own device.
     train_loader, val_loader, test_loader = create_dataloaders(
         base_dir=args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers,
         dataset_type=args.dataset, is_distributed=False, seed=args.seed, is_main=True)
     if len(test_loader.dataset) == 0:
         raise RuntimeError('The test split is empty.')
     check_label_convention(test_loader.dataset)
-    fit_loader = make_fit_loader(train_loader, val_loader, args.batch_size, args.num_workers, primary_device)
+    fit_loader = make_fit_loader(train_loader, val_loader, args.batch_size, args.num_workers, device)
 
-    # ---- models: load each one on its assigned device -----------------------
+    # ---- models ------------------------------------------------------------
     models, forwards, histories = [], [], []
-    print('\n' + '=' * 70)
-    print('Loading models and assigning GPUs (round-robin)')
-    print('=' * 70)
     for i, (name, path) in enumerate(zip(args.model_names, args.model_paths)):
-        dev = device_for_model(i, devices)
-        print(f'  [{i}] {name}  ->  {dev}')
-        model, history = load_checkpoint(path, dev)
+        if is_main:
+            print(f'\nLoading model {name} ...')
+        model, history = load_checkpoint(path, device)
         models.append(model)
-        forwards.append(build_forward(model, DEFAULT_MEANS[i], DEFAULT_STDS[i], dev))
+        forwards.append(build_forward(model, DEFAULT_MEANS[i], DEFAULT_STDS[i], device))
         histories.append(history)
 
-    # ---- parallel inference on train split + test split ---------------------
-    print('\n' + '=' * 70)
-    print('Parallel inference across devices')
-    print('=' * 70)
-    raw_fit, raw_test, y_fit_all, y_test_all = parallel_collect_outputs(
-        forwards, models, args, fit_loader, test_loader, devices, args.model_names,
-    )
-
-    # consistency check on labels
-    y_fit_ref, y_test_ref = y_fit_all[0], y_test_all[0]
+    # ---- inference on train split (to learn the fuzzy measures) and test split
+    #      (sharded over the GPUs, gathered back in the original order)
+    raw_fit, raw_test = [], []
+    y_fit_ref, y_test_ref = None, None
     for i, name in enumerate(args.model_names):
-        if not (np.array_equal(y_fit_all[i], y_fit_ref) and np.array_equal(y_test_all[i], y_test_ref)):
-            raise RuntimeError(f'Label order differs for model {name} (data loader is not deterministic).')
+        if is_main:
+            print(f'\n[{name}] inference on the train split ({len(fit_loader.dataset)} images) ...')
+        rf, yf = collect_outputs_parallel(forwards[i], fit_loader, device, rank, world, args.num_workers)
+        if is_main:
+            print(f'[{name}] inference on the test split ({len(test_loader.dataset)} images) ...')
+        rt, yt = collect_outputs_parallel(forwards[i], test_loader, device, rank, world, args.num_workers)
+        if y_fit_ref is None:
+            y_fit_ref, y_test_ref = yf, yt
+        else:
+            if not (np.array_equal(yf, y_fit_ref) and np.array_equal(yt, y_test_ref)):
+                raise RuntimeError('Label order differs between models (data loader is not deterministic).')
+        raw_fit.append(rf)
+        raw_test.append(rt)
+
+    # ---- parallel part is finished: release the process group, only rank 0 continues ----
+    if world > 1:
+        dist.barrier()
+        dist.destroy_process_group()
+        if not is_main:
+            return
+
     validate_binary_labels(y_fit_ref, 'Train')
     validate_binary_labels(y_test_ref, 'Test')
 
@@ -858,14 +826,6 @@ def main():
         print(f'[{name}] output interpreted as: {OUTPUT_KIND_DESC[kind]}')
         prob_fit.append(raw_to_prob_real(raw_fit[i].double(), kind))
         prob_test.append(raw_to_prob_real(raw_test[i].double(), kind))
-
-    # ---- gather every model on the primary device for the ensemble ----------
-    # (efficiency_utils.benchmark_efficiency expects a single-device ensemble)
-    print(f'\n[multi-gpu] moving all models to primary device {primary_device} for the ensemble.')
-    for m in models:
-        m.to(primary_device)
-    if primary_device.type == 'cuda':
-        torch.cuda.empty_cache()
 
     # ---- Choquet fuzzy integral: learn g with the GA on the train split -----
     scores_fit = torch.stack(prob_fit, dim=1)                  # (N_train, 3) float64
@@ -907,10 +867,11 @@ def main():
         else:
             plot_training_curves(series, num_epochs, args.save_dir, name)
 
-    # ---- efficiency (single-device ensemble on the primary GPU) -------------
-    ensemble = ChoquetEnsemble(models, DEFAULT_MEANS, DEFAULT_STDS, kinds, g_best).to(primary_device)
+    # ---- efficiency (efficiency_utils.benchmark_efficiency, as in the training pipeline) ----
+    # runs on a single GPU (rank 0 / cuda:0) on purpose: latency / throughput must be measured on one device
+    ensemble = ChoquetEnsemble(models, DEFAULT_MEANS, DEFAULT_STDS, kinds, g_best).to(device)
     ensemble.eval()
-    run_efficiency(ensemble, args.model_names, test_loader, primary_device, args.save_dir, args.latency_samples)
+    run_efficiency(ensemble, args.model_names, test_loader, device, args.save_dir, args.latency_samples)
 
     print(f'All outputs were saved to: {os.path.abspath(args.save_dir)}')
 
