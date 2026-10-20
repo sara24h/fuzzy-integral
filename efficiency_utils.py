@@ -141,7 +141,7 @@ def measure_latency(fn, samples, device, warmup=50):
     return stats, outs
 
 @torch.no_grad()
-def measure_throughput(fn, batches, device, warmup_iters=30, num_iters=100, repeats=3):
+def measure_throughput(fn, batches, device, warmup_iters=30, num_iters=100, repeats=10):
     """
     Throughput on pre-loaded GPU batches (cycled if num_iters > len(batches)).
     One run = num_iters forward passes, timed with synchronize on both ends.
@@ -192,7 +192,7 @@ def measure_throughput(fn, batches, device, warmup_iters=30, num_iters=100, repe
     return res
 
 @torch.no_grad()
-def measure_full_pass(fn, loader, device, repeats=3):
+def measure_full_pass(fn, loader, device, repeats=10):
     """
     `repeats` passes over the WHOLE test loader.
       model_compute_time_s : time spent in the model only
@@ -238,7 +238,7 @@ def benchmark_efficiency(ensemble, test_loader, device, model_names,
                          latency_samples=300, latency_warmup=50,
                          throughput_batches=20, throughput_warmup=30,
                          throughput_iters=100, verbose=False,
-                         throughput_repeats=3, full_pass_repeats=3,
+                         throughput_repeats=10, full_pass_repeats=10,
                          gpu_warmup_s=3.0):
 
     # Events / memory stats must refer to the device that is being benchmarked
