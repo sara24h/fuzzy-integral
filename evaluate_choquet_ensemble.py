@@ -59,7 +59,7 @@ DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2
 ENSEMBLE_NAME = 'choquet_ensemble'
 
 # passes over the whole test set when timing each single model (same default as efficiency_utils)
-FULL_PASS_REPEATS = 3
+FULL_PASS_REPEATS = 10
 
 # Genetic-algorithm helpers
 FUZZY_EPS = 1e-6                              # margin that makes Eq. (1) a strict inequality
