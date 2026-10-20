@@ -68,7 +68,7 @@ PAIR_INDICES = [(0, 1), (0, 2), (1, 2)]       # g12, g13, g23  == genes 3, 4, 5
 
 HISTORY_KEYS = ('train_loss', 'val_loss', 'train_acc', 'val_acc')
 
-METRIC_KEYS = ['acc','precision_real', 'recall_real', 'f1_real',
+METRIC_KEYS = ['acc', 'precision_real', 'recall_real', 'f1_real',
                'precision_fake', 'recall_fake', 'f1_fake',
                'macro_precision', 'macro_recall', 'macro_f1']
 
@@ -367,7 +367,7 @@ def is_feasible(g):
 
 
 def fit_fuzzy_measure_ga(scores, labels_bool, pop_size, max_iter, early_stopping,
-                         p_cross, p_mut, tournament_size, seed):
+                         p_cross, p_mut, tournament_size, seed, device=None):
     """
     Genetic algorithm that learns the fuzzy measures (paper Fig. 4).
     scores      : (N, 3) float64 tensor, detector outputs P(real) on the training split
@@ -375,8 +375,17 @@ def fit_fuzzy_measure_ga(scores, labels_bool, pop_size, max_iter, early_stopping
     Fitness = correct classification rate of the Choquet output thresholded at 0.5.
     Crossover (Eq. 2): h1 = 0.5*(C1 + C2), h2 = 1.5*C1 - 0.5*C2.
     Mutation  (Eq. 3): C_m = h_i +/- r/4, r ~ U(0, 1).
+
+    Returns
+    -------
+    best      : np.ndarray, shape (6,)
+    best_fit  : float, best train accuracy (fraction)
+    ga_timing : dict with total / per-generation times and fitness history
     """
+    if device is None:
+        device = torch.device('cpu')
     rng = np.random.RandomState(seed)
+    total_sw = eff.Stopwatch(device).start()
 
     def fitness(ind):
         out = choquet_integral(scores, torch.from_numpy(ind))
@@ -398,7 +407,11 @@ def fit_fuzzy_measure_ga(scores, labels_bool, pop_size, max_iter, early_stopping
     stall = 0
     print(f'  GA init : best train accuracy = {best_fit * 100:.2f}%')
 
+    gen_times, fitness_history = [], [float(best_fit)]
+    early_stopped = False
+
     for gen in range(1, max_iter + 1):
+        gen_sw = eff.Stopwatch(device).start()
         children = [best.copy()]                          # elitism
         while len(children) < pop_size:
             p1, p2 = tournament(pop, fits), tournament(pop, fits)
@@ -418,14 +431,31 @@ def fit_fuzzy_measure_ga(scores, labels_bool, pop_size, max_iter, early_stopping
             stall = 0
         else:
             stall += 1
-        print(f'  GA gen {gen:02d}: best train accuracy = {best_fit * 100:.2f}% (stall {stall}/{early_stopping})')
+        t_gen = gen_sw.stop()
+        gen_times.append(float(t_gen))
+        fitness_history.append(float(best_fit))
+        print(f'  GA gen {gen:02d}: best train accuracy = {best_fit * 100:.2f}% '
+              f'(stall {stall}/{early_stopping}) | {t_gen:.3f}s')
         if stall >= early_stopping:
             print(f'  GA early stopping at generation {gen}.')
+            early_stopped = True
             break
+
+    total_time = total_sw.stop()
+    ga_timing = {
+        'total_training_time_s': float(total_time),
+        'total_training_time_min': float(total_time / 60.0),
+        'num_generations': len(gen_times),
+        'mean_generation_time_s': float(np.mean(gen_times)) if gen_times else 0.0,
+        'generation_times_s': gen_times,
+        'best_train_accuracy': float(best_fit),
+        'early_stopped': bool(early_stopped),
+        'fitness_history': fitness_history,
+    }
 
     if not is_feasible(best):
         raise RuntimeError('GA produced an infeasible fuzzy measure (internal error).')
-    return best, best_fit
+    return best, best_fit, ga_timing
 
 
 # =============================================================================
@@ -475,7 +505,7 @@ def print_metrics_table(name, dataset, m):
     print(f"{'accuracy (%)':<22}{m['acc']:>12.2f}")
     for key in METRIC_KEYS:
         print(f'{key:<22}{m[key]:>12.4f}')
-    
+
     print(f"{'balanced_acc (%)':<22}{m['balanced_acc']:>12.2f}")
     print(line)
 
@@ -584,6 +614,28 @@ def plot_training_curves(history, num_epochs, save_dir, model_name):
 
 
 # =============================================================================
+# GA fitness curve (analog of training curves for this script's "training")
+# =============================================================================
+def plot_ga_fitness_curve(ga_timing, save_dir):
+    history = ga_timing.get('fitness_history', [])
+    if len(history) < 2:
+        print('[skip] GA fitness curve: not enough generations to plot.')
+        return
+    gens = list(range(len(history)))      # 0 = initialization, 1..G = generations
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(gens, [f * 100.0 for f in history], marker='o', color='blue', linewidth=2, markersize=5)
+    ax.set_title('GA Fitness Evolution (Best Train Accuracy)', fontsize=14)
+    ax.set_xlabel('Generation (0 = initialization)', fontsize=12)
+    ax.set_ylabel('Best Train Accuracy (%)', fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.7)
+    fig.tight_layout()
+    path = os.path.join(save_dir, 'ga_fitness_curve.png')
+    fig.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✅ GA fitness curve saved to: {path}")
+
+
+# =============================================================================
 # Efficiency: latency / throughput / computational time (efficiency_utils.benchmark_efficiency)
 # =============================================================================
 class MultiModelNormalization(nn.Module):
@@ -640,6 +692,7 @@ class ChoquetEnsemble(nn.Module):
 
 
 def run_efficiency(ensemble, names, test_loader, device, save_dir, latency_samples):
+    """Run efficiency benchmark and return the result dict. Caller is responsible for saving."""
     n_total = len(test_loader.dataset)
     n_lat = n_total if latency_samples is None else min(latency_samples, n_total)
     if n_lat > 5000:
@@ -666,12 +719,9 @@ def run_efficiency(ensemble, names, test_loader, device, save_dir, latency_sampl
           'Choquet ensemble, which always runs all models.)')
     eff.print_headline(results)
 
-    report_path = os.path.join(save_dir, 'efficiency_report.json')
-    with open(report_path, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f'Efficiency report saved: {report_path}')
     if device.type == 'cuda':
         torch.cuda.empty_cache()
+    return results
 
 
 # =============================================================================
@@ -685,6 +735,10 @@ def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     if device.type == 'cuda':
         torch.cuda.set_device(device)
+
+    # ---------- PIPELINE STOPWATCH ----------
+    pipeline_sw = eff.Stopwatch(device).start()
+    # ---------------------------------------
 
     print('=' * 70)
     print('Configuration')
@@ -707,7 +761,8 @@ def main():
     check_label_convention(test_loader.dataset)
     fit_loader = make_fit_loader(train_loader, val_loader, args.batch_size, args.num_workers, device)
 
-    # ---- models ------------------------------------------------------------
+    # ---- models (timed) ----------------------------------------------------
+    load_sw = eff.Stopwatch(device).start()
     models, forwards, histories = [], [], []
     for i, (name, path) in enumerate(zip(args.model_names, args.model_paths)):
         print(f'\nLoading model {name} ...')
@@ -715,22 +770,39 @@ def main():
         models.append(model)
         forwards.append(build_forward(model, DEFAULT_MEANS[i], DEFAULT_STDS[i], device))
         histories.append(history)
+    model_loading_time_s = load_sw.stop()
+    print(f'[timing] Model loading: {model_loading_time_s:.2f}s')
 
-    # ---- inference on train split (to learn the fuzzy measures) and test split
-    raw_fit, raw_test = [], []
-    y_fit_ref, y_test_ref = None, None
+    # ---- inference on train split (timed) ----------------------------------
+    raw_fit, y_fit_ref = [], None
+    fit_inference_sw = eff.Stopwatch(device).start()
     for i, name in enumerate(args.model_names):
         print(f'\n[{name}] inference on the train split ({len(fit_loader.dataset)} images) ...')
         rf, yf = collect_outputs(forwards[i], fit_loader, device)
+        if y_fit_ref is None:
+            y_fit_ref = yf
+        else:
+            if not np.array_equal(yf, y_fit_ref):
+                raise RuntimeError('Label order differs between models (train data loader is not deterministic).')
+        raw_fit.append(rf)
+    fit_inference_time_s = fit_inference_sw.stop()
+    print(f'[timing] Train-split inference (all models): {fit_inference_time_s:.2f}s')
+
+    # ---- inference on test split (timed) -----------------------------------
+    raw_test, y_test_ref = [], None
+    test_inference_sw = eff.Stopwatch(device).start()
+    for i, name in enumerate(args.model_names):
         print(f'[{name}] inference on the test split ({len(test_loader.dataset)} images) ...')
         rt, yt = collect_outputs(forwards[i], test_loader, device)
-        if y_fit_ref is None:
-            y_fit_ref, y_test_ref = yf, yt
+        if y_test_ref is None:
+            y_test_ref = yt
         else:
-            if not (np.array_equal(yf, y_fit_ref) and np.array_equal(yt, y_test_ref)):
-                raise RuntimeError('Label order differs between models (data loader is not deterministic).')
-        raw_fit.append(rf)
+            if not np.array_equal(yt, y_test_ref):
+                raise RuntimeError('Label order differs between models (test data loader is not deterministic).')
         raw_test.append(rt)
+    test_inference_time_s = test_inference_sw.stop()
+    print(f'[timing] Test-split inference (all models): {test_inference_time_s:.2f}s')
+
     validate_binary_labels(y_fit_ref, 'Train')
     validate_binary_labels(y_test_ref, 'Test')
 
@@ -745,18 +817,20 @@ def main():
         prob_fit.append(raw_to_prob_real(raw_fit[i].double(), kind))
         prob_test.append(raw_to_prob_real(raw_test[i].double(), kind))
 
-    # ---- Choquet fuzzy integral: learn g with the GA on the train split -----
+    # ---- Choquet fuzzy integral: learn g with the GA on the train split ----
     scores_fit = torch.stack(prob_fit, dim=1)                  # (N_train, 3) float64
     scores_test = torch.stack(prob_test, dim=1)                # (N_test, 3)  float64
     labels_fit = torch.from_numpy(y_fit_ref == 1)              # bool, True = real
     print('\n' + '=' * 70)
     print('Learning the Choquet fuzzy measures with the genetic algorithm (train split)')
     print('=' * 70)
-    g_best, ga_acc = fit_fuzzy_measure_ga(
+    g_best, ga_acc, ga_timing = fit_fuzzy_measure_ga(
         scores_fit, labels_fit, args.ga_pop_size, args.ga_max_iter, args.ga_early_stopping,
-        args.ga_crossover_prob, args.ga_mutation_prob, args.ga_tournament_size, args.seed)
+        args.ga_crossover_prob, args.ga_mutation_prob, args.ga_tournament_size,
+        args.seed, device=device)
     names = args.model_names
-    print(f'\nLearned fuzzy measures (x1={names[0]}, x2={names[1]}, x3={names[2]}); train accuracy {ga_acc * 100:.2f}%')
+    print(f'\nLearned fuzzy measures (x1={names[0]}, x2={names[1]}, x3={names[2]}); '
+          f'train accuracy {ga_acc * 100:.2f}%')
     print(f'  g{{}}         = 0')
     print(f'  g{{x1}}       = {g_best[0]:.7f}')
     print(f'  g{{x2}}       = {g_best[1]:.7f}')
@@ -765,6 +839,11 @@ def main():
     print(f'  g{{x1,x3}}    = {g_best[4]:.7f}')
     print(f'  g{{x2,x3}}    = {g_best[5]:.7f}')
     print(f'  g{{x1,x2,x3}} = 1')
+
+    print(f"\n[timing] GA training: {ga_timing['total_training_time_s']:.2f}s "
+          f"({ga_timing['num_generations']} generations, "
+          f"mean {ga_timing['mean_generation_time_s']:.3f}s/gen"
+          f"{', early-stopped' if ga_timing['early_stopped'] else ''})")
 
     g_t = torch.from_numpy(g_best)
     fused_test = choquet_integral(scores_test, g_t).numpy()
@@ -775,7 +854,10 @@ def main():
     for name, y_score in evaluations:
         evaluate_and_report(name, args.dataset, y_test_ref, y_score, args.save_dir)
 
-    # ---- training curves -----------------------------------------------------
+    # ---- GA fitness curve (analog of training curves) ----------------------
+    plot_ga_fitness_curve(ga_timing, args.save_dir)
+
+    # ---- training curves of the base models (from checkpoint history) ------
     print()
     for name, history in zip(args.model_names, histories):
         series, num_epochs = prepare_history(history, args.epochs)
@@ -788,7 +870,64 @@ def main():
     # ---- efficiency (efficiency_utils.benchmark_efficiency, as in the training pipeline) ----
     ensemble = ChoquetEnsemble(models, DEFAULT_MEANS, DEFAULT_STDS, kinds, g_best).to(device)
     ensemble.eval()
-    run_efficiency(ensemble, args.model_names, test_loader, device, args.save_dir, args.latency_samples)
+
+    efficiency_results = run_efficiency(
+        ensemble, args.model_names, test_loader, device, args.save_dir, args.latency_samples)
+
+    # ---- total pipeline time (captured after everything) -------------------
+    total_pipeline_time_s = pipeline_sw.stop()
+
+    # ---- attach timing info and save ---------------------------------------
+    timing_info = {
+        'training_time': ga_timing,                     # "training" == GA for this method
+        'model_loading_time_s': float(model_loading_time_s),
+        'fit_inference_time_s': float(fit_inference_time_s),
+        'test_inference_time_s': float(test_inference_time_s),
+        'total_pipeline_time_s': float(total_pipeline_time_s),
+    }
+    efficiency_results['timing'] = timing_info
+
+    report_path = os.path.join(args.save_dir, 'efficiency_report.json')
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(efficiency_results, f, indent=2, default=str)
+    print(f'Efficiency report saved: {report_path}')
+
+    final_results = {
+        'dataset': args.dataset,
+        'seed': args.seed,
+        'model_names': list(args.model_names),
+        'learned_fuzzy_measures': {
+            'g_empty': 0.0,
+            'g_x1': float(g_best[0]),
+            'g_x2': float(g_best[1]),
+            'g_x3': float(g_best[2]),
+            'g_x1x2': float(g_best[3]),
+            'g_x1x3': float(g_best[4]),
+            'g_x2x3': float(g_best[5]),
+            'g_full': 1.0,
+        },
+        'ga_train_accuracy': float(ga_acc),
+        'timing': timing_info,
+    }
+    final_results_path = os.path.join(args.save_dir, 'final_results_choquet.json')
+    with open(final_results_path, 'w', encoding='utf-8') as f:
+        json.dump(final_results, f, indent=2, default=str)
+    print(f'Final results saved: {final_results_path}')
+
+    # ---- TIME SUMMARY ------------------------------------------------------
+    print('\n' + '=' * 70)
+    print('TIME SUMMARY')
+    print('=' * 70)
+    print(f'  Model loading                 : {model_loading_time_s:.2f}s')
+    print(f'  Train-split inference (fit)   : {fit_inference_time_s:.2f}s')
+    print(f'  Test-split inference          : {test_inference_time_s:.2f}s')
+    print(f"  GA training (fuzzy measures)  : {ga_timing['total_training_time_s']:.2f}s "
+          f"({ga_timing['total_training_time_min']:.2f} min, "
+          f"{ga_timing['num_generations']} gens, "
+          f"mean {ga_timing['mean_generation_time_s']:.3f}s/gen)")
+    print(f'  Total pipeline time           : {total_pipeline_time_s / 60:.2f} min '
+          f'({total_pipeline_time_s:.2f}s)')
+    print('=' * 70)
 
     print(f'All outputs were saved to: {os.path.abspath(args.save_dir)}')
 
